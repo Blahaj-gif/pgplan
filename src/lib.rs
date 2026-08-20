@@ -7,6 +7,9 @@
 //! drive it against a real Postgres — which they must, because a plan is the
 //! database's opinion and no model of one is worth gating on.
 
+pub mod baseline;
 pub mod explain;
+pub mod fingerprint;
+pub mod queries;
 pub mod regress;
 pub mod shape;
