@@ -149,6 +149,13 @@ register as a two-fold regression.
 asserts that the same data twice gives the same answer, that a fresh `ANALYZE`
 moves nothing, and that adding an index never fails a build.
 
+## Contributing
+
+The most useful contribution is one more named regression. The bar and the
+mechanics are in [CONTRIBUTING.md](CONTRIBUTING.md) — the short version is that
+a rule has to be provable from two plans, has to have a threshold, and has to
+be proved not to fire when the query got *better*.
+
 ## Licence
 
 MIT.

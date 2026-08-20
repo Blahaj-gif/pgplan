@@ -1,0 +1,92 @@
+name: test
+
+# Four jobs, split by what they need rather than by what they are. The fast
+# hermetic half runs on every pull request; the half that starts a Postgres
+# takes minutes and runs there too, because a plan is the database's opinion
+# and there is no useful test of this project that does not ask one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # `postgresql_embedded` resolves its Postgres build through the GitHub API in
+  # a build script, so *compiling* the integration tests needs a token —
+  # unauthenticated runners share a rate limit they lose. Without this the
+  # failure is `403 rate limit exceeded` during a lint, which is a confusing
+  # way to be told nothing is wrong with the code.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check:
+    name: unit tests, lints, formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No version here: rust-toolchain.toml decides, so CI and a laptop lint
+      # against the same compiler and a new lint does not arrive as a mystery.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      # The plan parser, the shape, the closed set and the query file reader.
+      # All pure, and where most of the reasoning lives.
+      - run: cargo test --lib
+
+  msrv:
+    name: the oldest compiler it claims to build on
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-toolchain.toml` would override the toolchain below, and the whole
+      # point here is to use a different compiler from the one it names.
+      - run: rm -f rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      # The library and the binary, and deliberately not `--all-targets`: that
+      # pulls in dev-dependencies, and `postgresql_embedded` wants a newer
+      # compiler than a user running `cargo install` ever needs. `rust-version`
+      # is the user's promise, so the user's build is what gets checked.
+      - run: cargo build --locked
+
+  database:
+    name: against a real planner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@v2
+      # Every named regression provoked for real — the index dropped, the
+      # column hidden behind a cast, work_mem shrunk — plus the end-to-end
+      # exit codes CI itself depends on.
+      #
+      # One thread: each test starts its own server, and several at once on a
+      # two-core runner is how a suite starts failing for reasons that are
+      # about the runner rather than the code.
+      - run: cargo test --test regressions --test cli -- --test-threads=1
+
+  stability:
+    name: it must not flap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@v2
+      # Its own job because flapping is the failure mode that kills this
+      # category of tool, and a gate people switch off is worse than no gate.
+      # Run twice on purpose: a test that only flaps sometimes passes a suite
+      # that only runs it once.
+      - run: cargo test --test stability -- --test-threads=1
+      - run: cargo test --test stability -- --test-threads=1

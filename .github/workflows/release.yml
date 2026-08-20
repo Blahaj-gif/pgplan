@@ -1,0 +1,84 @@
+name: release
+
+# Binaries for the three platforms, built when a version tag is pushed.
+#
+# The README tells a reader they can take a binary from the releases page
+# instead of building one. That sentence is only true if something builds them,
+# and a promise in a README that nothing keeps is worse than no promise.
+
+on:
+  push:
+    tags: ["v*"]
+  # So the workflow can be proved to work without inventing a version.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      # The binary is renamed to carry its target, because three files called
+      # `pgplan` in one release directory is not a release.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=pgplan-${{ matrix.target }}
+          if [ -f "target/${{ matrix.target }}/release/pgplan.exe" ]; then
+            cp "target/${{ matrix.target }}/release/pgplan.exe" "$name.exe"
+            sha256sum "$name.exe" > "$name.exe.sha256"
+          else
+            cp "target/${{ matrix.target }}/release/pgplan" "$name"
+            chmod +x "$name"
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+
+      # Proof it runs at all on the platform it was built for. A binary nobody
+      # started is not a binary anybody can use.
+      - name: It starts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "pgplan-${{ matrix.target }}.exe" ]; then
+            ./pgplan-${{ matrix.target }}.exe --version
+          else
+            ./pgplan-${{ matrix.target }} --version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgplan-${{ matrix.target }}
+          path: |
+            pgplan-${{ matrix.target }}*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: pgplan-*
+          generate_release_notes: true
