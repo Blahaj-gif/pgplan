@@ -149,6 +149,41 @@ register as a two-fold regression.
 asserts that the same data twice gives the same answer, that a fresh `ANALYZE`
 moves nothing, and that adding an index never fails a build.
 
+## Measured on schemas nobody here designed
+
+Every test above runs against a fixture written by the same person who wrote the
+rule it exercises, which measures agreement rather than accuracy. So the same
+checks were run against twenty-four production schemas — GitLab, Discourse,
+Mattermost, Synapse and others — seeded by [pgseed][pgseed] at volume and
+queried on indexes those projects chose for themselves.
+
+Of 68 queries that the planner routed through an index, then had that index
+dropped:
+
+| | |
+|---|---:|
+| a sequential scan was named | **61** (90%) |
+| only the missing index was named | 7 |
+| nothing was said | **0** |
+
+And with the index left alone — re-`ANALYZE`d, a column added, an unrelated
+index added, each of which is an ordinary migration:
+
+| | |
+|---|---:|
+| findings reported when nothing got worse | **0** |
+
+The second table is the one that decides whether anyone leaves this switched on.
+
+Nine of the twenty-four schemas produced no measurement at all: seven offer no
+non-unique single-column index on a scalar type, and two could not be seeded
+inside the time budget. They are counted as could-not-measure rather than
+quietly dropped. The method, the full per-schema table, and three ways this
+survey gave a wrong answer before it gave a right one are in
+[docs/corpus-validation.md](docs/corpus-validation.md).
+
+[pgseed]: https://github.com/Blahaj-gif/pgseed
+
 ## Contributing
 
 The most useful contribution is one more named regression. The bar and the
