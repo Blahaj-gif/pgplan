@@ -23,7 +23,7 @@ mod harness;
 /// How long one schema's seeding may take before it is written off. Generous
 /// against a schema of ordinary size, and a schema that needs longer is
 /// reported as unmeasured rather than allowed to stop the survey.
-const SEED_BUDGET: u64 = 420;
+const SEED_BUDGET: u64 = 600;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -227,6 +227,14 @@ struct Tally {
     /// so it is counted apart rather than folded into a headline.
     named_only_the_index: usize,
     missed: usize,
+    /// An ORDER BY that the index used to supply, with the index gone. Counts
+    /// the schemas where a `Sort` was named for it.
+    sort_tried: usize,
+    sort_named: usize,
+    /// The same row, fetched through a predicate the index cannot serve.
+    /// Nothing is dropped: this is the innocent-looking ORM change.
+    wrapped_tried: usize,
+    wrapped_named: usize,
     /// The index could not be dropped, so the experiment never happened. Kept
     /// out of every ratio rather than counted as a miss.
     undropped: usize,
@@ -426,7 +434,55 @@ fn against_schemas_nobody_here_designed() {
             }
         }
 
-        // Experiment three: drop the index each query depends on. Split in
+        // Experiment three: wrap the indexed column so the planner cannot see
+        // through it, which is what an ORM upgrade does by accident. Nothing
+        // is dropped and the answer is identical, so a test that checks
+        // results cannot see it at all. This is the only one of the six named
+        // regressions that needs no schema change to provoke.
+        let (mut wrapped_tried, mut wrapped_named) = (0, 0);
+        for (look, _, before) in &baselined {
+            let Some(value) = a_value(&mut client, look) else {
+                continue;
+            };
+            // Concatenation rather than a bare `::text`: on a text column the
+            // cast is identity, the planner sees straight through it, and the
+            // index is still used — so reporting nothing there was correct and
+            // counting it as a miss understated this. Appending an empty
+            // string defeats the index for every column type in the candidate
+            // set, which is what makes the denominator mean something.
+            let sql = format!(
+                "SELECT * FROM {} WHERE {}::text || '' = {value}::text",
+                quote(&look.table),
+                quote(&look.column)
+            );
+            if let Ok(plan) = plan_of(&mut client, &sql) {
+                wrapped_tried += 1;
+                if !compare(before, &Shape::of(&plan)).is_empty() {
+                    wrapped_named += 1;
+                }
+            }
+        }
+
+        // Experiment four: an ORDER BY the index was supplying. Recorded now,
+        // judged after the drop below, because the drop is what takes the
+        // ordering away. Only queries that started without a Sort are kept: if
+        // the planner was already sorting, a Sort appearing is not news.
+        let mut ordered = Vec::new();
+        for (look, _, _) in &baselined {
+            let sql = format!(
+                "SELECT * FROM {} ORDER BY {} LIMIT 50",
+                quote(&look.table),
+                quote(&look.column)
+            );
+            if let Ok(plan) = plan_of(&mut client, &sql) {
+                let shape = Shape::of(&plan);
+                if shape.indexes.contains(&look.index) && shape.sorts.is_empty() {
+                    ordered.push((sql, shape));
+                }
+            }
+        }
+
+        // Experiment five: drop the index each query depends on. Split in
         // two, because "the index named in the baseline is absent" becomes
         // true the instant it is dropped and says nothing about whether this
         // tool can recognise a degraded plan. The scan finding is the one with
@@ -460,8 +516,26 @@ fn against_schemas_nobody_here_designed() {
             }
         }
 
+        // The ordering queries, now that their index is gone.
+        let sort_tried = ordered.len();
+        let mut sort_named = 0;
+        for (sql, before) in &ordered {
+            if let Ok(plan) = plan_of(&mut client, sql) {
+                if compare(before, &Shape::of(&plan))
+                    .iter()
+                    .any(|r| matches!(r, Regression::SortAppeared { .. }))
+                {
+                    sort_named += 1;
+                }
+            }
+        }
+
         total.schemas += 1;
         total.candidates += found.len();
+        total.sort_tried += sort_tried;
+        total.sort_named += sort_named;
+        total.wrapped_tried += wrapped_tried;
+        total.wrapped_named += wrapped_named;
         total.queries += baselined.len();
         total.named_the_scan += named_scan;
         total.named_only_the_index += named_index;
@@ -504,6 +578,22 @@ fn against_schemas_nobody_here_designed() {
             total.undropped
         );
     }
+    println!(
+        "\n  indexed column wrapped so the planner cannot use it, of {}:",
+        total.wrapped_tried
+    );
+    println!(
+        "    named ............................. {}",
+        total.wrapped_named
+    );
+    println!(
+        "\n  ORDER BY that an index was supplying, index dropped, of {}:",
+        total.sort_tried
+    );
+    println!(
+        "    a sort was named .................. {}",
+        total.sort_named
+    );
     println!("\n  reported when nothing got worse:");
     println!("    nothing changed at all ........... {}", total.flapped);
     println!(

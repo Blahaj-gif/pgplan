@@ -157,29 +157,33 @@ checks were run against twenty-four production schemas — GitLab, Discourse,
 Mattermost, Synapse and others — seeded by [pgseed][pgseed] at volume and
 queried on indexes those projects chose for themselves.
 
-Of 68 queries that the planner routed through an index, then had that index
-dropped:
+Of 76 queries the planner routed through an index, then degraded three ways:
+
+| | | |
+|---|---:|---:|
+| the index dropped, a sequential scan named | **67** | (88%) |
+| the index dropped, only the index named | 9 | |
+| the index dropped, nothing said | **0** | |
+| the column wrapped so the index cannot serve it | **76** | (100%) |
+| an `ORDER BY` the index supplied, a sort named | **68 of 75** | (91%) |
+
+And with nothing made worse — re-`ANALYZE`d, a column added, an unrelated index
+added, each an ordinary migration:
 
 | | |
 |---|---:|
-| a sequential scan was named | **61** (90%) |
-| only the missing index was named | 7 |
-| nothing was said | **0** |
+| findings reported | **0** |
 
-And with the index left alone — re-`ANALYZE`d, a column added, an unrelated
-index added, each of which is an ordinary migration:
+The last table is the one that decides whether anyone leaves this switched on.
+The wrapped-column row is the one closest to a real incident: no schema changes,
+the answer is identical, and only the plan is worse — so a test that checks
+results cannot see it at all.
 
-| | |
-|---|---:|
-| findings reported when nothing got worse | **0** |
-
-The second table is the one that decides whether anyone leaves this switched on.
-
-Nine of the twenty-four schemas produced no measurement at all: seven offer no
-non-unique single-column index on a scalar type, and two could not be seeded
-inside the time budget. They are counted as could-not-measure rather than
-quietly dropped. The method, the full per-schema table, and three ways this
-survey gave a wrong answer before it gave a right one are in
+Seven of the twenty-four schemas produced no measurement, because they offer no
+non-unique single-column index on a scalar type. They are counted as
+could-not-measure rather than quietly dropped. The method, the full per-schema
+table, the three of six named regressions this does *not* exercise, and four
+ways the survey gave a wrong answer before it gave a right one are in
 [docs/corpus-validation.md](docs/corpus-validation.md).
 
 [pgseed]: https://github.com/Blahaj-gif/pgseed
