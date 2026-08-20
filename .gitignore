@@ -1,0 +1,4 @@
+/target
+# A baseline is a project's own file, committed by the project that made it.
+# The ones written while testing here are not.
+/plans.json

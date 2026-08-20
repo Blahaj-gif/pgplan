@@ -1,0 +1,19 @@
+# The toolchain this is developed and linted against.
+#
+# Not pinned for the sake of it: clippy gains lints between releases, so
+# `stable` means CI lints against a compiler the author does not have and
+# rejects code that passed on their machine. That happened twice in the hour
+# after this repository went public, once for `question_mark` and once for
+# `unnecessary_sort_by`, and neither had anything to do with whether the code
+# was right.
+#
+# Same reasoning as pinning the corpus: a check that gives a different answer
+# on a different day is not one you can act on. Bumping this is a commit
+# somebody can review, and the lints that arrive with it get fixed then rather
+# than in whatever pull request happens to be open.
+#
+# `rust-version` in Cargo.toml is a different promise — the oldest compiler
+# this is expected to *build* on — and is deliberately much lower.
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
