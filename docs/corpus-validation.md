@@ -86,11 +86,17 @@ than by choosing: single-column `contype = 'f'`, both sides holding rows, and
 preferring the pairs whose referencing column nobody indexed.
 
 That preference is the point. **Postgres creates an index for a primary key and
-none at all for a foreign key.** Across these twenty-four schemas, 113 of 729
-distinct foreign-key columns have no index leading on them, and 15 of the 29
-usable pairs here are of that kind. A nested loop that lands on that side reads
-the whole table once per outer row, and nobody has to have made a mistake for
-that to happen — one row estimate has to collapse.
+none at all for a foreign key.** Of the 29 usable pairs here, asked of the live
+catalogue after seeding rather than counted out of the DDL, **15 have no index
+on the referencing column**. A nested loop that lands on that side reads the
+whole table once per outer row, and nobody has to have made a mistake for that
+to happen — one row estimate has to collapse.
+
+A wider count across all of the corpus's foreign keys is deliberately not
+offered. The only cheap way to get one is a regex over the DDL text, and that
+cannot tell `user_id` on one table from `user_id` on another, so it produces a
+number that looks measured and is not. 15 of 29 is what this survey can stand
+behind.
 
 The estimate is not what is manipulated here. Inducing a bad estimate on demand
 across twenty-four unfamiliar schemas is its own research project, so the join
