@@ -13,7 +13,13 @@ use crate::fingerprint::Fingerprint;
 use crate::shape::Shape;
 
 /// Bumped only when an older file can no longer be read correctly.
-pub const VERSION: u32 = 1;
+///
+/// 2: a shape now records which tables were scanned sequentially on the inner
+/// side of a nested loop. A version-1 file does not carry that, so every plan
+/// in it would compare as though no loop had ever touched anything — the
+/// comparison would run and quietly answer a different question. Refusing it is
+/// the only honest reading.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -108,6 +114,28 @@ mod tests {
     fn a_file_that_is_not_a_baseline_says_so() {
         let error = Baseline::from_json("{\"nonsense\": true}").unwrap_err();
         assert!(error.contains("could not be read"));
+    }
+
+    /// The file that exists in somebody's repository right now.
+    ///
+    /// It parses — the new field defaults — and that is exactly the danger: it
+    /// would compare cleanly and mean something else. The version check is what
+    /// turns a wrong answer into an instruction.
+    #[test]
+    fn a_baseline_written_before_the_shape_grew_is_refused_not_reinterpreted() {
+        let old = r#"{
+          "version": 1,
+          "fingerprint": {"tables": {"t": ["id:integer"]}, "volume": {"t": 4}},
+          "queries": {"by id": {"sql": "SELECT * FROM t WHERE id = 1", "shape": {
+            "access": {"t": "Indexed"}, "indexes": ["t_pkey"], "nodes": ["Index Scan"],
+            "rows_scanned": 1.0, "rows_returned": 1.0, "max_batches": 1,
+            "sorts": [], "sequential_rows": {}}}}
+        }"#;
+        let error = Baseline::from_json(old).unwrap_err();
+        assert!(
+            error.contains("Re-run"),
+            "an older file must be told what to do, not guessed at: {error}"
+        );
     }
 
     /// The committed file is reviewed by people, so its diff has to be legible.

@@ -8,9 +8,15 @@
 //! So what is stored is a deliberately lossy summary: **which tables were
 //! reached how, which indexes were used, how many rows were touched, and what
 //! kinds of node appeared.** Everything else — costs, estimates, widths,
-//! parallel worker counts, the shape of the tree itself — is read and thrown
-//! away, because none of it can be compared across two machines without
-//! producing an argument rather than an answer.
+//! parallel worker counts — is read and thrown away, because none of it can be
+//! compared across two machines without producing an argument rather than an
+//! answer.
+//!
+//! The tree's structure is thrown away too, with exactly one exception. A
+//! sequential scan on the inner side of a nested loop runs once per outer row,
+//! and no summary that has forgotten which side it was on can tell that from
+//! the same table being read once elsewhere in the same plan. So that one fact
+//! is kept, and it is kept because a rule needs it — not because it was there.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +56,55 @@ pub struct Shape {
     /// Tables read sequentially, with how many rows that cost. Kept separately
     /// from `access` because the threshold questions need the number.
     pub sequential_rows: BTreeMap<String, f64>,
+    /// Tables read sequentially *beneath the inner side of a nested loop*,
+    /// with rows summed across every iteration.
+    ///
+    /// A subset of `sequential_rows`, kept apart because it is the only thing
+    /// that can tell an accidental quadratic from a large table being read
+    /// once somewhere else in the same plan. Without it the rule had to settle
+    /// for "a nested loop exists" and "some table is scanned" — two facts that
+    /// are usually about different halves of the tree.
+    ///
+    /// Defaulted rather than required so a baseline written before this field
+    /// existed still parses, and is then refused by the version check with a
+    /// message that says what to do instead of a parse error that does not.
+    #[serde(default)]
+    pub inner_loop_rows: BTreeMap<String, f64>,
+}
+
+/// Every table scanned sequentially under a nested loop's inner side.
+///
+/// `Node::walk` is flat, and flat is enough for every other field here: it does
+/// not matter *where* an index was used, only that it was. It matters entirely
+/// here, because "the inner side" is the whole claim. So this one walks the
+/// tree as a tree.
+///
+/// Which side a child is on comes from the planner's own `Parent Relationship`,
+/// falling back to position for a plan that did not say. A `Materialize` above
+/// the inner side is deliberately not special-cased: the scan beneath it reads
+/// the table once and reports one loop, so what is counted falls to what the
+/// plan actually read from disk rather than to what multiplying by the outer
+/// row count would suggest. The finding then rests on that table being large
+/// enough to be worth scanning at all, which is the honest claim.
+fn inner_sequential(root: &Node) -> BTreeMap<String, f64> {
+    fn descend(node: &Node, under_inner: bool, out: &mut BTreeMap<String, f64>) {
+        if under_inner && node.node_type == "Seq Scan" && !node.is_counted_by_parent() {
+            if let Some(table) = &node.relation {
+                *out.entry(table.clone()).or_insert(0.0) += node.rows_read();
+            }
+        }
+        let loops_here = node.node_type == "Nested Loop";
+        for (position, child) in node.children.iter().enumerate() {
+            let is_inner = match child.parent_relationship.as_deref() {
+                Some(side) => side == "Inner",
+                None => position == 1,
+            };
+            descend(child, under_inner || (loops_here && is_inner), out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    descend(root, false, &mut out);
+    out
 }
 
 impl Shape {
@@ -63,6 +118,7 @@ impl Shape {
             max_batches: 1,
             sorts: BTreeSet::new(),
             sequential_rows: BTreeMap::new(),
+            inner_loop_rows: inner_sequential(root),
         };
 
         for node in root.walk() {
@@ -155,6 +211,70 @@ mod tests {
                   "Actual Rows": 900.0, "Actual Loops": 1.0}]}"#,
         );
         assert_eq!(shape.access.get("t"), Some(&Access::Sequential));
+    }
+
+    /// The shape the whole `NestedLoopOverSequentialScan` rule rests on: an
+    /// inner sequential scan reporting one row per loop and three thousand
+    /// loops has read three thousand rows, not one.
+    #[test]
+    fn a_sequential_scan_on_the_inner_side_is_recorded_as_such() {
+        let shape = shape_of(
+            r#"{"Node Type": "Nested Loop", "Actual Rows": 3000.0, "Actual Loops": 1.0,
+                 "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "parent",
+                    "Parent Relationship": "Outer",
+                    "Actual Rows": 3000.0, "Actual Loops": 1.0},
+                   {"Node Type": "Seq Scan", "Relation Name": "child",
+                    "Parent Relationship": "Inner",
+                    "Actual Rows": 1.0, "Rows Removed by Filter": 2999.0,
+                    "Actual Loops": 3000.0}]}"#,
+        );
+        assert_eq!(shape.inner_loop_rows.get("child"), Some(&9_000_000.0));
+        assert_eq!(
+            shape.inner_loop_rows.get("parent"),
+            None,
+            "the outer side is read once and is not the quadratic"
+        );
+    }
+
+    /// The false positive that made the old rule unusable: a nested loop in one
+    /// branch and a large sequential scan in another are two unrelated facts.
+    #[test]
+    fn a_sequential_scan_elsewhere_in_the_plan_is_not_on_the_inner_side() {
+        let shape = shape_of(
+            r#"{"Node Type": "Append", "Actual Rows": 2.0, "Actual Loops": 1.0, "Plans": [
+                 {"Node Type": "Nested Loop", "Actual Rows": 1.0, "Actual Loops": 1.0,
+                  "Parent Relationship": "Member", "Plans": [
+                    {"Node Type": "Index Scan", "Relation Name": "a", "Index Name": "a_pkey",
+                     "Parent Relationship": "Outer", "Actual Rows": 1.0, "Actual Loops": 1.0},
+                    {"Node Type": "Index Scan", "Relation Name": "b", "Index Name": "b_pkey",
+                     "Parent Relationship": "Inner", "Actual Rows": 1.0, "Actual Loops": 1.0}]},
+                 {"Node Type": "Seq Scan", "Relation Name": "log",
+                  "Parent Relationship": "Member",
+                  "Actual Rows": 40000.0, "Actual Loops": 1.0}]}"#,
+        );
+        assert!(
+            shape.inner_loop_rows.is_empty(),
+            "nothing here is a sequential scan on an inner side: {:?}",
+            shape.inner_loop_rows
+        );
+        assert_eq!(shape.sequential_rows.get("log"), Some(&40_000.0));
+    }
+
+    /// A plan from a source that did not label its children still has to be
+    /// read, and for a two-child join the second one is the inner side.
+    #[test]
+    fn without_a_label_the_second_child_is_the_inner_side() {
+        let shape = shape_of(
+            r#"{"Node Type": "Nested Loop", "Actual Rows": 1.0, "Actual Loops": 1.0,
+                 "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "a",
+                    "Actual Rows": 5.0, "Actual Loops": 1.0},
+                   {"Node Type": "Seq Scan", "Relation Name": "b",
+                    "Actual Rows": 200.0, "Actual Loops": 5.0}]}"#,
+        );
+        assert_eq!(shape.inner_loop_rows.get("b"), Some(&1_000.0));
+        assert_eq!(shape.inner_loop_rows.get("a"), None);
     }
 
     #[test]

@@ -49,6 +49,11 @@ pub struct Node {
     /// Present on a `Sort`, and the reason an index that supplied order is
     /// worth noticing the loss of.
     pub sort_key: Vec<String>,
+    /// What this node is to its parent — "Outer", "Inner", "Member", and so
+    /// on. The planner's own word for it, and the only thing that says which
+    /// side of a nested loop a subtree is on. Position says the same for a
+    /// plain join and stops saying it the moment a plan has three children.
+    pub parent_relationship: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -188,6 +193,7 @@ pub fn parse(value: &serde_json::Value) -> Node {
         batches: value
             .get("Hash Batches")
             .and_then(serde_json::Value::as_i64),
+        parent_relationship: text("Parent Relationship"),
         sort_key: value
             .get("Sort Key")
             .and_then(serde_json::Value::as_array)
@@ -251,6 +257,32 @@ mod tests {
         );
         let kinds: Vec<&str> = tree.walk().iter().map(|n| n.node_type.as_str()).collect();
         assert_eq!(kinds, ["Nested Loop", "Seq Scan", "Index Scan"]);
+    }
+
+    /// Which side of a join a subtree is on, in the planner's own words. The
+    /// inner side of a nested loop runs once per outer row, and that is the
+    /// difference between a join and an accident.
+    #[test]
+    fn a_child_knows_which_side_of_its_parent_it_is_on() {
+        let tree = parse(
+            &serde_json::from_str(
+                r#"{"Node Type": "Nested Loop", "Plans": [
+                     {"Node Type": "Seq Scan", "Relation Name": "a",
+                      "Parent Relationship": "Outer"},
+                     {"Node Type": "Seq Scan", "Relation Name": "b",
+                      "Parent Relationship": "Inner"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(tree.parent_relationship, None, "the root is nobody's child");
+        assert_eq!(
+            tree.children[0].parent_relationship.as_deref(),
+            Some("Outer")
+        );
+        assert_eq!(
+            tree.children[1].parent_relationship.as_deref(),
+            Some("Inner")
+        );
     }
 
     #[test]

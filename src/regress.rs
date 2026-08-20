@@ -64,8 +64,9 @@ impl Regression {
                  the baseline. The query is doing more work for the same answer."
             ),
             Regression::SortAppeared { keys } => format!(
-                "a sort on ({}) appeared where the baseline had none — an index was supplying \
-                 that order and no longer is.",
+                "a sort on ({}) appeared where the baseline had none, so this query is now \
+                 ordering rows it used to get in order for free. The usual cause is an \
+                 index that supplied that order being dropped, or hidden from the planner.",
                 keys.join(", ")
             ),
             Regression::HashJoinSpilled { batches } => format!(
@@ -106,20 +107,25 @@ pub fn compare(before: &Shape, after: &Shape) -> Vec<Regression> {
         });
     }
 
-    // The accidental quadratic. Only when it is new: a nested loop that was
-    // always there and is still there is the plan working as designed.
-    if after.nodes.contains("Nested Loop") {
-        for (table, rows) in &after.sequential_rows {
-            let was_sequential = before
-                .sequential_rows
-                .get(table)
-                .is_some_and(|had| *had >= *rows);
-            if *rows >= SEQ_SCAN_ROWS && !was_sequential && before.nodes.contains("Nested Loop") {
-                found.push(Regression::NestedLoopOverSequentialScan {
-                    table: table.clone(),
-                    rows: *rows,
-                });
-            }
+    // The accidental quadratic, and the only rule here that needs the plan's
+    // structure rather than a summary of it. `inner_loop_rows` holds a table
+    // only when the plan really did scan it once per outer row, so the finding
+    // can say "on its inner side" and have that be a fact rather than an
+    // inference drawn from two unrelated ones.
+    //
+    // Two thresholds, because either alone is wrong. `SEQ_SCAN_ROWS` is the
+    // same floor the sequential-scan rule uses — below it the planner is being
+    // sensible. The second asks that it got *materially* worse rather than
+    // merely moved: a loop already reading this table this hard is the plan
+    // working as designed, and the build has been passing or failing on it
+    // since the baseline was taken either way.
+    for (table, rows) in &after.inner_loop_rows {
+        let had = before.inner_loop_rows.get(table).copied().unwrap_or(0.0);
+        if *rows >= SEQ_SCAN_ROWS && *rows >= had * AMPLIFICATION_FACTOR {
+            found.push(Regression::NestedLoopOverSequentialScan {
+                table: table.clone(),
+                rows: *rows,
+            });
         }
     }
 
@@ -138,6 +144,13 @@ pub fn compare(before: &Shape, after: &Shape) -> Vec<Regression> {
     // A sort that was not there before, where the baseline reached its data
     // through an index. Without that second condition this fires whenever
     // somebody adds an ORDER BY, which is a change and not a regression.
+    //
+    // That condition is a proxy, and knowingly a loose one: it establishes that
+    // *an* index was in use, not that the index in use was the one supplying
+    // this order. Sort keys are not reliably qualified by table, so tying the
+    // two together is not something this can currently show. The message
+    // therefore states what is proven — the sort is new — and offers the cause
+    // as the usual one rather than asserting it.
     let new_sorts: Vec<String> = after.sorts.difference(&before.sorts).cloned().collect();
     if !new_sorts.is_empty()
         && !before.nodes.contains("Sort")
@@ -257,6 +270,98 @@ mod tests {
                             "Actual Rows": 150.0, "Actual Loops": 1.0}]}"#,
         );
         assert!(compare(&before, &after).is_empty());
+    }
+
+    /// The case the rule is named for, and the one it used to miss entirely.
+    ///
+    /// The old rule required a `Nested Loop` in the *baseline*, so a plan that
+    /// acquired one — the ordinary way this degradation arrives — was excluded
+    /// by construction. Nine million rows for a one-row answer, and silence.
+    #[test]
+    fn a_join_that_becomes_a_loop_over_a_sequential_scan_is_a_regression() {
+        let before = shape(
+            r#"{"Node Type": "Aggregate", "Actual Rows": 1.0, "Actual Loops": 1.0, "Plans": [
+                 {"Node Type": "Hash Join", "Actual Rows": 3000.0, "Actual Loops": 1.0,
+                  "Hash Batches": 1, "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "parent",
+                    "Parent Relationship": "Outer",
+                    "Actual Rows": 3000.0, "Actual Loops": 1.0},
+                   {"Node Type": "Hash", "Parent Relationship": "Inner",
+                    "Actual Rows": 3000.0, "Actual Loops": 1.0, "Plans": [
+                     {"Node Type": "Seq Scan", "Relation Name": "child",
+                      "Parent Relationship": "Outer",
+                      "Actual Rows": 3000.0, "Actual Loops": 1.0}]}]}]}"#,
+        );
+        let after = shape(
+            r#"{"Node Type": "Aggregate", "Actual Rows": 1.0, "Actual Loops": 1.0, "Plans": [
+                 {"Node Type": "Nested Loop", "Actual Rows": 3000.0, "Actual Loops": 1.0,
+                  "Plans": [
+                   {"Node Type": "Seq Scan", "Relation Name": "parent",
+                    "Parent Relationship": "Outer",
+                    "Actual Rows": 3000.0, "Actual Loops": 1.0},
+                   {"Node Type": "Seq Scan", "Relation Name": "child",
+                    "Parent Relationship": "Inner",
+                    "Actual Rows": 1.0, "Rows Removed by Filter": 2999.0,
+                    "Actual Loops": 3000.0}]}]}"#,
+        );
+        let found = compare(&before, &after);
+        assert!(
+            found.iter().any(|r| matches!(
+                r, Regression::NestedLoopOverSequentialScan { table, rows }
+                if table == "child" && *rows == 9_000_000.0)),
+            "the shape this rule is named for was not named: {found:?}"
+        );
+    }
+
+    /// And the other direction, which is the one that gets a gate switched off.
+    ///
+    /// A nested loop reaching both its sides through indexes and, in an
+    /// entirely different branch, a small table that grew. Two true facts about
+    /// one plan with no relationship between them; the old rule joined them and
+    /// reported a table no loop had ever touched.
+    #[test]
+    fn a_loop_and_an_unrelated_scan_are_two_facts_not_a_finding() {
+        let branch = |log_rows: f64| {
+            shape(&format!(
+                r#"{{"Node Type": "Append", "Actual Rows": 2.0, "Actual Loops": 1.0, "Plans": [
+                     {{"Node Type": "Nested Loop", "Parent Relationship": "Member",
+                       "Actual Rows": 1.0, "Actual Loops": 1.0, "Plans": [
+                        {{"Node Type": "Index Scan", "Relation Name": "a", "Index Name": "a_pkey",
+                          "Parent Relationship": "Outer",
+                          "Actual Rows": 1.0, "Actual Loops": 1.0}},
+                        {{"Node Type": "Index Scan", "Relation Name": "b", "Index Name": "b_pkey",
+                          "Parent Relationship": "Inner",
+                          "Actual Rows": 1.0, "Actual Loops": 1.0}}]}},
+                     {{"Node Type": "Seq Scan", "Relation Name": "log",
+                       "Parent Relationship": "Member",
+                       "Actual Rows": {log_rows}, "Actual Loops": 1.0}}]}}"#
+            ))
+        };
+        let found = compare(&branch(10.0), &branch(40_000.0));
+        assert!(
+            !found
+                .iter()
+                .any(|r| matches!(r, Regression::NestedLoopOverSequentialScan { .. })),
+            "nothing here is a scan on an inner side: {found:?}"
+        );
+    }
+
+    /// A loop that was always expensive and is still exactly as expensive has
+    /// not degraded. The baseline was taken with it in place; failing now would
+    /// be failing for something nobody changed.
+    #[test]
+    fn a_loop_that_was_already_this_expensive_is_not_a_new_regression() {
+        let plan = shape(
+            r#"{"Node Type": "Nested Loop", "Actual Rows": 1.0, "Actual Loops": 1.0, "Plans": [
+                 {"Node Type": "Seq Scan", "Relation Name": "a", "Parent Relationship": "Outer",
+                  "Actual Rows": 100.0, "Actual Loops": 1.0},
+                 {"Node Type": "Seq Scan", "Relation Name": "b", "Parent Relationship": "Inner",
+                  "Actual Rows": 500.0, "Actual Loops": 100.0}]}"#,
+        );
+        assert!(
+            compare(&plan, &plan).is_empty(),
+            "fifty thousand inner rows in the baseline and fifty thousand now"
+        );
     }
 
     #[test]
