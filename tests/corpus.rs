@@ -30,8 +30,8 @@ use std::path::PathBuf;
 
 use harness::Db;
 use pgplan::explain::plan_of;
-use pgplan::regress::{compare, Regression};
-use pgplan::shape::Shape;
+use pgplan::regress::{compare, Regression, SEQ_SCAN_ROWS};
+use pgplan::shape::{Access, Shape};
 
 /// Where pgseed keeps its corpus and its binary. Both are optional.
 fn pgseed_dir() -> PathBuf {
@@ -193,6 +193,68 @@ fn finished_within(mut child: std::process::Child, seconds: u64) -> bool {
     }
 }
 
+/// Two tables a foreign key relates, and whether anybody indexed the key.
+///
+/// The last field is the point. Postgres creates an index for a primary key
+/// and none at all for a foreign key, so the referencing side of most
+/// relationships in most schemas is unindexed — and a nested loop that lands
+/// on that side reads the whole table once per outer row. The pairs without an
+/// index are therefore the interesting ones, and they are preferred.
+struct Pair {
+    child: String,
+    key: String,
+    parent: String,
+    referenced: String,
+    indexed: bool,
+}
+
+fn related(client: &mut postgres::Client, limit: usize) -> Vec<Pair> {
+    let rows = client
+        .query(
+            "SELECT c.relname, a.attname, p.relname, pa.attname,
+                    EXISTS (SELECT 1 FROM pg_index x
+                            WHERE x.indrelid = c.oid AND x.indkey[0] = a.attnum)
+             FROM pg_constraint k
+             JOIN pg_class c ON c.oid = k.conrelid
+             JOIN pg_class p ON p.oid = k.confrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_attribute a  ON a.attrelid = c.oid AND a.attnum = k.conkey[1]
+             JOIN pg_attribute pa ON pa.attrelid = p.oid AND pa.attnum = k.confkey[1]
+             WHERE k.contype = 'f'
+               AND array_length(k.conkey, 1) = 1
+               AND n.nspname NOT IN ('pg_catalog','information_schema')
+               AND c.relkind = 'r' AND p.relkind = 'r'
+               AND c.oid <> p.oid
+               -- Both sides have to have been seeded. A join against an empty
+               -- table plans as nothing and measures nothing.
+               AND c.reltuples > 500 AND p.reltuples > 500
+             ORDER BY 5, p.reltuples DESC, c.relname",
+            &[],
+        )
+        .unwrap_or_default();
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for row in &rows {
+        let child: String = row.get(0);
+        let parent: String = row.get(2);
+        if !seen.insert((child.clone(), parent.clone())) {
+            continue;
+        }
+        out.push(Pair {
+            child,
+            key: row.get(1),
+            parent,
+            referenced: row.get(3),
+            indexed: row.get(4),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
 /// A value that exists, so the query returns something and the plan is real.
 fn a_value(client: &mut postgres::Client, look: &Lookup) -> Option<String> {
     let sql = format!(
@@ -235,6 +297,43 @@ struct Tally {
     /// Nothing is dropped: this is the innocent-looking ORM change.
     wrapped_tried: usize,
     wrapped_named: usize,
+    /// Foreign-key pairs found with rows on both sides — the denominator for
+    /// the three join experiments below.
+    pairs: usize,
+    /// Of those, the ones whose referencing column nobody indexed. Reported
+    /// because the claim that this shape is common rests on it.
+    pairs_unindexed: usize,
+    /// A join forced onto a nested loop. `bit` counts the times the planner
+    /// actually put a sequential scan on the inner side; only those could
+    /// possibly be detected, and only those are a denominator. An experiment
+    /// that did not bite is not a tool that missed something.
+    loop_tried: usize,
+    loop_bit: usize,
+    loop_named: usize,
+    /// Of the bites, the ones on a pair whose referencing column somebody had
+    /// indexed. Expected to be low: an indexed key gives the loop an index scan
+    /// on its inner side, and then there is nothing to find. Counted so the
+    /// claim that the silences are *correct* silences rests on a number.
+    loop_bit_indexed: usize,
+    /// The same join with work_mem at the floor. `bit` counts the times the
+    /// hash join really did start spilling; the planner is entitled to choose
+    /// a different join instead, and that is not a miss either.
+    spill_tried: usize,
+    spill_bit: usize,
+    spill_named: usize,
+    /// A count through an index that was then dropped: one row returned either
+    /// way, and the whole table read to produce it the second time.
+    ///
+    /// `scanned` is the bite measure, and it is here because the first version
+    /// of this experiment did not have one. Dropping an index does not oblige
+    /// the planner to start reading the table — it may reach it another way, or
+    /// the value may be common enough that it was reading most of it already.
+    /// Only the times it genuinely fell back to a sequential scan belong in the
+    /// denominator, and even then silence below the two-fold threshold is the
+    /// rule working rather than failing.
+    ratio_tried: usize,
+    ratio_scanned: usize,
+    ratio_named: usize,
     /// The index could not be dropped, so the experiment never happened. Kept
     /// out of every ratio rather than counted as a miss.
     undropped: usize,
@@ -482,7 +581,124 @@ fn against_schemas_nobody_here_designed() {
             }
         }
 
-        // Experiment five: drop the index each query depends on. Split in
+        // Experiments five and six need two tables that are actually related,
+        // because three of the six named regressions are about joins and a
+        // single-table lookup cannot provoke any of them. Postgres does not
+        // index a foreign key, so the referencing side is usually unindexed —
+        // which is the whole reason the shape below is a real incident rather
+        // than a curiosity.
+        let pairs = related(&mut client, 2);
+        let (mut loop_tried, mut loop_bit, mut loop_named) = (0, 0, 0);
+        let mut loop_bit_indexed = 0;
+        let (mut spill_tried, mut spill_bit, mut spill_named) = (0, 0, 0);
+        // A join that goes quadratic can take a long time to *run*, and
+        // EXPLAIN ANALYZE runs it. One schema stalling must not cost the rest.
+        let _ = client.batch_execute("SET statement_timeout = '60s'");
+        for pair in &pairs {
+            // The parent on the left, so the child is the nullable side and
+            // the planner has to put it on the inside of any loop it chooses.
+            // Without that it is free to swap them, and on the schemas here it
+            // does: it put the child on the outside and memoized a primary-key
+            // lookup on the inside, which is the planner being right.
+            let join = format!(
+                "SELECT count(*) FROM {} p LEFT JOIN {} c ON c.{} = p.{}",
+                quote(&pair.parent),
+                quote(&pair.child),
+                quote(&pair.key),
+                quote(&pair.referenced)
+            );
+            let Ok(plan) = plan_of(&mut client, &join) else {
+                continue;
+            };
+            let before = Shape::of(&plan);
+
+            // Experiment five: the same join, planned as a loop. The row
+            // estimate is not what is manipulated — inducing a bad estimate on
+            // twenty-four unfamiliar schemas is its own project — so the join
+            // methods are switched off, which arrives at the same plan by a
+            // different route. What is measured is whether the shape is
+            // recognised when it appears, not how often it appears.
+            loop_tried += 1;
+            let _ = client.batch_execute("SET enable_hashjoin = off; SET enable_mergejoin = off;");
+            if let Ok(plan) = plan_of(&mut client, &join) {
+                let after = Shape::of(&plan);
+                // The worst inner scan in the plan, against the same row floor
+                // the rule uses. Counting a bite the rule is *right* to ignore
+                // would make this harness fail the build for pgplan being
+                // correct on a small table — which is the exact failure this
+                // whole project is built to avoid, arriving from inside its own
+                // evidence. Borrowed from the crate rather than restated, so
+                // the two cannot drift apart.
+                let worst = after
+                    .inner_loop_rows
+                    .values()
+                    .copied()
+                    .fold(0.0_f64, f64::max);
+                if worst < SEQ_SCAN_ROWS {
+                    // Either the planner found something better even with two
+                    // join methods gone, or the inner side is small enough that
+                    // scanning it is the right answer. Nothing to detect.
+                } else {
+                    loop_bit += 1;
+                    if pair.indexed {
+                        loop_bit_indexed += 1;
+                    }
+                    if compare(&before, &after)
+                        .iter()
+                        .any(|r| matches!(r, Regression::NestedLoopOverSequentialScan { .. }))
+                    {
+                        loop_named += 1;
+                    }
+                }
+            }
+            let _ = client.batch_execute("RESET enable_hashjoin; RESET enable_mergejoin;");
+
+            // Experiment six: the same join with work_mem at the floor, which
+            // is what a busy machine and a grown table look like together.
+            spill_tried += 1;
+            let _ = client.batch_execute("SET work_mem = '64kB'");
+            if let Ok(plan) = plan_of(&mut client, &join) {
+                let after = Shape::of(&plan);
+                if before.max_batches <= 1 && after.max_batches > 1 {
+                    spill_bit += 1;
+                    if compare(&before, &after)
+                        .iter()
+                        .any(|r| matches!(r, Regression::HashJoinSpilled { .. }))
+                    {
+                        spill_named += 1;
+                    }
+                }
+            }
+            let _ = client.batch_execute("RESET work_mem");
+        }
+        let _ = client.batch_execute("RESET statement_timeout");
+
+        // Experiment seven, baselined here and judged after the drop below: a
+        // count through the index. One row comes back whichever way it is
+        // planned, so the answer is unchanged and only the work moves — which
+        // is exactly what the rows-per-row-returned rule is for. Separated from
+        // the wrapped experiment on purpose: folded together, a finding of any
+        // kind was being read as evidence for this one.
+        let mut counted = std::collections::BTreeMap::new();
+        for (look, _, _) in &baselined {
+            let Some(value) = a_value(&mut client, look) else {
+                continue;
+            };
+            let sql = format!(
+                "SELECT count(*) FROM {} WHERE {} = {value}",
+                quote(&look.table),
+                quote(&look.column)
+            );
+            if let Ok(plan) = plan_of(&mut client, &sql) {
+                let shape = Shape::of(&plan);
+                if shape.indexes.contains(&look.index) {
+                    counted.insert(look.index.clone(), (sql, shape));
+                }
+            }
+        }
+        let (mut ratio_tried, mut ratio_scanned, mut ratio_named) = (0, 0, 0);
+
+        // Experiment eight: drop the index each query depends on. Split in
         // two, because "the index named in the baseline is absent" becomes
         // true the instant it is dropped and says nothing about whether this
         // tool can recognise a degraded plan. The scan finding is the one with
@@ -514,6 +730,26 @@ fn against_schemas_nobody_here_designed() {
                     missed += 1;
                 }
             }
+            // The same index, gone, judged for the ratio rule alone.
+            if let Some((count_sql, count_before)) = counted.get(&look.index) {
+                if let Ok(plan) = plan_of(&mut client, count_sql) {
+                    let count_after = Shape::of(&plan);
+                    ratio_tried += 1;
+                    // Did the experiment bite? Only if the count now reads the
+                    // table where it used to reach it through the index.
+                    if count_before.access.get(&look.table) == Some(&Access::Indexed)
+                        && count_after.access.get(&look.table) == Some(&Access::Sequential)
+                    {
+                        ratio_scanned += 1;
+                    }
+                    if compare(count_before, &count_after)
+                        .iter()
+                        .any(|r| matches!(r, Regression::MoreRowsPerRowReturned { .. }))
+                    {
+                        ratio_named += 1;
+                    }
+                }
+            }
         }
 
         // The ordering queries, now that their index is gone.
@@ -536,6 +772,18 @@ fn against_schemas_nobody_here_designed() {
         total.sort_named += sort_named;
         total.wrapped_tried += wrapped_tried;
         total.wrapped_named += wrapped_named;
+        total.pairs += pairs.len();
+        total.pairs_unindexed += pairs.iter().filter(|pair| !pair.indexed).count();
+        total.loop_tried += loop_tried;
+        total.loop_bit += loop_bit;
+        total.loop_named += loop_named;
+        total.loop_bit_indexed += loop_bit_indexed;
+        total.spill_tried += spill_tried;
+        total.spill_bit += spill_bit;
+        total.spill_named += spill_named;
+        total.ratio_tried += ratio_tried;
+        total.ratio_scanned += ratio_scanned;
+        total.ratio_named += ratio_named;
         total.queries += baselined.len();
         total.named_the_scan += named_scan;
         total.named_only_the_index += named_index;
@@ -544,8 +792,9 @@ fn against_schemas_nobody_here_designed() {
         total.flapped += flapped;
         total.benign += benign;
         let line = format!(
-            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2}",
-            baselined.len()
+            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2} · fk {:>1} loop {loop_named}/{loop_bit} spill {spill_named}/{spill_bit} ratio {ratio_named}/{ratio_scanned}",
+            baselined.len(),
+            pairs.len()
         );
         println!("{line}");
         per_schema.push(line);
@@ -594,6 +843,30 @@ fn against_schemas_nobody_here_designed() {
         "    a sort was named .................. {}",
         total.sort_named
     );
+    println!(
+        "\n  joins, from {} foreign-key pairs with rows on both sides ({} with no index on the referencing column):",
+        total.pairs, total.pairs_unindexed
+    );
+    println!(
+        "    forced onto a nested loop ......... {} tried, {} put a sequential scan on the inner side ({} of those on an indexed key), {} named",
+        total.loop_tried, total.loop_bit, total.loop_bit_indexed, total.loop_named
+    );
+    println!(
+        "    work_mem at the floor ............. {} tried, {} actually spilled, {} named",
+        total.spill_tried, total.spill_bit, total.spill_named
+    );
+    println!(
+        "\n  a count through an index that was then dropped, of {} tried:",
+        total.ratio_tried
+    );
+    println!(
+        "    the count fell back to a scan ..... {}",
+        total.ratio_scanned
+    );
+    println!(
+        "    read far more for the same answer . {}",
+        total.ratio_named
+    );
     println!("\n  reported when nothing got worse:");
     println!("    nothing changed at all ........... {}", total.flapped);
     println!(
@@ -626,6 +899,32 @@ fn against_schemas_nobody_here_designed() {
     assert!(
         total.named_the_scan > 0,
         "not one dropped index produced a sequential-scan finding, so the only          thing measured was that a dropped index has a name"
+    );
+    // Only the experiments that bit are asserted on. One that did not bite is
+    // not evidence in either direction, and treating it as a miss is the
+    // mistake this survey has already made twice in other clothes.
+    //
+    // What these two are worth, stated rather than implied. Both bite measures
+    // necessarily share a condition with the rule they check — a spill *is*
+    // batches going from one to more than one — so neither is a strong test of
+    // the rule's definition. What they are strong evidence of is that the shape
+    // occurs on schemas nobody here designed, that the tool names it every time
+    // it occurs, and, in the loop's case, that it stays quiet on the pairs
+    // where somebody had indexed the foreign key. The silences are the half
+    // that is not near-circular, and they are the half that decides whether a
+    // gate survives.
+    assert_eq!(
+        total.loop_bit,
+        total.loop_named,
+        "a sequential scan on the inner side of a nested loop went unreported \
+         {} times",
+        total.loop_bit - total.loop_named
+    );
+    assert_eq!(
+        total.spill_bit,
+        total.spill_named,
+        "a hash join started spilling and was not reported {} times",
+        total.spill_bit - total.spill_named
     );
     assert!(
         total.schemas >= 8,

@@ -77,7 +77,7 @@ quiet at exactly the moment it had something to say.
 | an index stopped being used | named, so you know which one |
 | a nested loop over a sequential scan | fast on ten rows, fatal on a million |
 | more rows read per row returned | the work went up and the answer did not |
-| a sort appeared | an index was supplying that order and no longer is |
+| a sort appeared | this query now orders rows it used to get in order for free |
 | a hash join started spilling | it fitted in memory before |
 
 ## Why it needs realistic data
@@ -155,9 +155,10 @@ Every test above runs against a fixture written by the same person who wrote the
 rule it exercises, which measures agreement rather than accuracy. So the same
 checks were run against twenty-four production schemas — GitLab, Discourse,
 Mattermost, Synapse and others — seeded by [pgseed][pgseed] at volume and
-queried on indexes those projects chose for themselves.
+queried on indexes those projects chose for themselves. All six named
+regressions are exercised there, three of them only since the joins were added.
 
-Of 76 queries the planner routed through an index, then degraded three ways:
+Of 76 queries the planner routed through an index, then degraded four ways:
 
 | | | |
 |---|---:|---:|
@@ -166,6 +167,14 @@ Of 76 queries the planner routed through an index, then degraded three ways:
 | the index dropped, nothing said | **0** | |
 | the column wrapped so the index cannot serve it | **76** | (100%) |
 | an `ORDER BY` the index supplied, a sort named | **68 of 75** | (91%) |
+| a `count(*)` whose index went, of the 67 that fell back to a scan | **67** | (100%) |
+
+And across 29 foreign-key pairs with rows on both sides, joined:
+
+| | | |
+|---|---:|---:|
+| forced onto a nested loop, of the 12 that put a scan on the inner side | **12** | (100%) |
+| `work_mem` at its floor, of the 27 that actually spilled | **27** | (100%) |
 
 And with nothing made worse — re-`ANALYZE`d, a column added, an unrelated index
 added, each an ordinary migration:
@@ -179,11 +188,20 @@ The wrapped-column row is the one closest to a real incident: no schema changes,
 the answer is identical, and only the plan is worse — so a test that checks
 results cannot see it at all.
 
+**Every denominator above is what the experiment actually did, not what it was
+asked to do.** Dropping an index does not oblige the planner to start reading
+the table; cramping `work_mem` does not oblige a hash join to spill. Counting
+those as misses is a mistake this survey made three times before it stopped
+making it, so each experiment reports *tried*, *bit* and *named* separately and
+only the bites are a denominator.
+
 Seven of the twenty-four schemas produced no measurement, because they offer no
-non-unique single-column index on a scalar type. They are counted as
+non-unique single-column index on a scalar type — and since seeding follows that
+search, their joins are not reached either. They are counted as
 could-not-measure rather than quietly dropped. The method, the full per-schema
-table, the three of six named regressions this does *not* exercise, and four
-ways the survey gave a wrong answer before it gave a right one are in
+table, what the numbers do *not* show, five ways the survey gave a wrong answer
+before it gave a right one, and the two bugs it found in this tool's own
+nested-loop rule are in
 [docs/corpus-validation.md](docs/corpus-validation.md).
 
 [pgseed]: https://github.com/Blahaj-gif/pgseed
