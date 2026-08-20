@@ -272,7 +272,10 @@ fn against_schemas_nobody_here_designed() {
         // Statement failures are tolerated: a production dump references
         // extensions and roles a bare server does not have, and the point is
         // to get a large real schema into a database, not to replay it.
-        for statement in statements(&sql).into_iter().filter(|s| shapes_the_schema(s)) {
+        for statement in statements(&sql)
+            .into_iter()
+            .filter(|s| shapes_the_schema(s))
+        {
             let _ = client.batch_execute(&statement);
         }
         let _ = client.batch_execute("SET search_path TO public;");
@@ -336,7 +339,8 @@ fn against_schemas_nobody_here_designed() {
 
         let found = lookups(&mut client, 6, true);
         if found.is_empty() {
-            let line = format!("  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · no rows behind an index");
+            let line =
+                format!("  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · no rows behind an index");
             println!("{line}");
             per_schema.push(line);
             continue;
@@ -364,7 +368,9 @@ fn against_schemas_nobody_here_designed() {
             }
         }
         if baselined.is_empty() {
-            let line = format!("  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · nothing planned through an index");
+            let line = format!(
+                "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · nothing planned through an index"
+            );
             println!("{line}");
             per_schema.push(line);
             continue;
