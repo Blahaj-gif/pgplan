@@ -177,12 +177,12 @@ And across 29 foreign-key pairs with rows on both sides, joined:
 | | | |
 |---|---:|---:|
 | forced onto a nested loop, of the 12 that put a scan on the inner side | **12** | (100%) |
-| `work_mem` at its floor, of the 27 that actually spilled | **27** | (100%) |
+| `work_mem` at its floor, of the 29 that actually spilled | **29** | (100%) |
 
-The spill row's denominator is the one thing here that moves: across three runs
-on identical data it bit 27, 29 and 27 times of 29, because `ANALYZE` samples
-and the planner's batch decision moves with the statistics. Every bite was named
-in every run, and no other figure above changed.
+The spill row's denominator is the one thing here that moves: across five runs
+on identical data it bit 27, 29, 27, 27 and 29 times of 29, because `ANALYZE`
+samples and the planner's batch decision moves with the statistics. Every bite
+was named in every run, and no other figure above changed in any of them.
 
 And with nothing made worse — re-`ANALYZE`d, a column added, an unrelated index
 added, each an ordinary migration:

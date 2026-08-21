@@ -21,6 +21,23 @@ use crate::shape::{Access, Shape};
 /// beats descending an index to fetch them one at a time, and Postgres knows
 /// that. Failing a build for it would be teaching people to add indexes that
 /// make their database slower.
+///
+/// It counts rows **actually read**, summed across every execution of the scan,
+/// rather than the size of the table. Those are not the same number, and the
+/// obvious objection is that repetition alone should carry a forty-row table
+/// over a thousand-row threshold from inside a nested loop.
+///
+/// Measured, it does not. Postgres materialises a small inner side instead of
+/// re-scanning it, so what is counted stays at the size of the table: nine
+/// arrangements, inner tables from 40 to 999 rows against outer sides up to
+/// fifty thousand, one of them with `work_mem` at its floor, and every single
+/// one materialised. The arrangement that does re-scan needs `enable_material`
+/// switched off — and there the rows genuinely are read, two hundred thousand
+/// of them, so reporting it is right rather than wrong.
+///
+/// Both halves of that are held by tests in `tests/regressions.rs`, so a future
+/// planner changing its mind about materialising reports itself as a failure
+/// rather than as silence.
 pub const SEQ_SCAN_ROWS: f64 = 1_000.0;
 
 /// How much worse the rows-read-per-row-returned ratio has to get.

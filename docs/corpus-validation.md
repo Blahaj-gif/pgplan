@@ -125,7 +125,7 @@ the nullable side to the inside, and it is also the more common query.
 
 ## Result
 
-Measured 2026-08-20, PostgreSQL via `postgresql_embedded`, 3,000 rows per table.
+Measured 2026-08-21, PostgreSQL via `postgresql_embedded`, 3,000 rows per table.
 
 ```
 24 schema files read
@@ -155,8 +155,9 @@ joins, from 29 foreign-key pairs with rows on both sides
   15 had no index on the referencing column
   forced onto a nested loop ......... 12 of 29 put a sequential scan on the
                                       inner side; all 12 were named
-  work_mem at the floor ............. 27 of 29 actually spilled;
-                                      all 27 were named
+  work_mem at the floor ............. 29 of 29 actually spilled;
+                                      all 29 were named
+                                      (27-29 across five runs; see below)
   could not be run at all ...........  0
 
 reported when nothing got worse
@@ -173,7 +174,7 @@ the experiment never bit there, which is also not a miss.
 | camunda | 6 | 6 | 0 | 0 | 1 | -- | 1/1 | 6/6 |
 | discourse | 5 | 5 | 0 | 0 | 2 | -- | 2/2 | 5/5 |
 | documenso | 5 | 5 | 0 | 0 | 2 | 2/2 | 2/2 | 5/5 |
-| gitlab | 4 | 3 | 1 | 0 | 2 | -- | -- | 3/3 |
+| gitlab | 4 | 3 | 1 | 0 | 2 | -- | 2/2 | 3/3 |
 | harbor | 2 | 2 | 0 | 0 | 0 | -- | -- | 2/2 |
 | hexpm | 6 | 6 | 0 | 0 | 2 | 2/2 | 2/2 | 6/6 |
 | hydra | 5 | 5 | 0 | 0 | 2 | 1/1 | 2/2 | 5/5 |
@@ -225,15 +226,20 @@ because the planner did not route them through the index even with it present.
 A query already being scanned sequentially cannot regress that way, and counting
 it would have flattered the result.
 
-**The spill experiment's denominator is not stable between runs.** Across three
-runs of identical code against identical seeded data it bit 27, then 29, then 27
-times out of 29. It is not errors or timeouts — the survey counts those
-separately and reported zero. The likely cause is that `ANALYZE` samples rather
-than reads every row, so column statistics differ a little between runs and the
-planner's hash-batch decision moves with them; that is stated as the likely
-cause rather than a demonstrated one. What did not move: pgplan named **every**
-bite in all three runs, and every other figure on this page was identical in all
-three. The denominator wobbles; the detection rate does not.
+**The spill experiment's denominator is not stable between runs.** Across five
+runs of identical code against identical seeded data it bit 27, 29, 27, 27 and
+29 times out of 29, and the movement is always the same two GitLab pairs. It is
+not errors or timeouts — the survey counts those separately and has reported
+zero every time. The likely cause is that `ANALYZE` samples rather than reading
+every row, so column statistics differ a little between runs and the planner's
+hash-batch decision moves with them; that is offered as the likely cause rather
+than a demonstrated one.
+
+What did not move, in any of the five: pgplan named **every** bite, and every
+other figure on this page was identical. The denominator wobbles; the detection
+rate does not. It is reported as a range rather than averaged into one tidy
+number, because the tidy number would be the only part of this page that nobody
+measured.
 
 **Two schemas offered no foreign-key pair at all** with rows on both sides:
 harbor and mattermost. Mattermost declares almost no foreign keys, which is a
@@ -403,12 +409,33 @@ corrected the headline in the other direction, because those nine had been
 sitting in the denominator of the dropped-index result and understating it. 67
 of 76 was never the number. 67 of 67 is.
 
-**`SequentialScanAppeared` remains unfixed and is recorded.** It sums rows across
-loops, so a forty-row table scanned forty times reads 1,600 and crosses a
-threshold whose stated purpose is "the table is big enough for this to matter".
-Both that rule and the nested-loop rule fire on such a plan, and only one of
-them has the right story: the remedy `SequentialScanAppeared` implies is an
-index, and the actual problem is the loop.
+**The fourth probe was wrong, and finding that out took a real planner.**
+`SequentialScanAppeared` sums rows across executions, so on paper a forty-row
+table on the inner side of a loop crosses a thousand-row threshold by repetition
+alone and fails a build for a table that fits in one page. Constructed as JSON by
+hand, it does exactly that.
+
+Against a real planner it does not happen. Postgres materialises a small inner
+side instead of re-scanning it, so the count stays at the size of the table.
+Nine arrangements were measured — inner tables from 40 to 999 rows, outer sides
+up to fifty thousand, one of them with `work_mem` at its floor — and every one
+materialised. The only way to produce the re-scan is to switch `enable_material`
+off, and there the rows genuinely are read, two hundred thousand of them, so
+reporting it is correct.
+
+So the rule was right and the fixture was wrong. `sequential_rows` counts rows
+actually read, which is the quantity worth thresholding on; the mistake was
+assuming it overstated what the plan did. What was owed was not a fix but an
+accurate comment on the constant, which had justified itself in terms of table
+size while measuring rows read, and two tests holding the boundary: a small
+lookup table on the inner side of a loop must never fail a build, and the same
+table genuinely re-scanned must be reported. If a future planner stops
+materialising, the first of those turns red and says so.
+
+That is the fourth time in this file a hand-written fixture has disagreed with a
+real server and lost. It is also the case for not treating a probe's output as a
+finding until a planner has seen it — the same discipline this page applies to
+its own numbers, turned on its own bug reports.
 
 ## What this survey found in pgseed
 

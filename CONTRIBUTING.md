@@ -71,23 +71,34 @@ over a foreign key somebody *did* index, a sequential scan of a small table.
 The catches are what the rule is for; the silences are what decide whether
 anybody leaves it switched on.
 
-Three bugs got through review here and were caught only by a live server:
+Four things got through review here and were caught only by a live server:
 
 - a filtered `Seq Scan` reports the rows it **kept**, with the discarded ones in
   `Rows Removed by Filter`, so a full table scan returning ten rows looked like
   a ten-row lookup;
 - a bitmap plan reports its rows **twice**, once on the index scan and once on
   the heap scan above it, which made *adding an index* register as a two-fold
-  regression.
-
+  regression;
+- `Hash Batches` is reported on the `Hash` node, not on the `Hash Join` above
+  it. A unit fixture put it on the join and passed anyway, which is a fixture
+  agreeing with its author;
 - and the planner will not simply do as it is told. A fixture built to force a
-  loop over an unindexed table instead had the child put on the *outside* with a
+  loop over an unindexed table instead put the child on the *outside* with a
   memoized primary-key lookup on the inside, which is the planner being right
   and the test measuring nothing. A `LEFT JOIN` pins the nullable side inward.
 
-None was reachable from a fixture: the first two are facts about what Postgres
-emits rather than what the docs say it emits, and the third is a fact about what
-it chooses.
+None was reachable from a fixture: the first three are facts about what Postgres
+emits rather than what the docs say it emits, and the fourth is a fact about
+what it chooses.
+
+**The same rule applies to bug reports, including your own.** A probe against
+hand-written JSON showed `SequentialScanAppeared` failing a build for a forty-row
+lookup table, because rows are summed across executions and repetition carried it
+over the threshold. It was a real-looking bug and it was not real: the planner
+materialises a small inner side rather than re-scanning it, so the count stays at
+forty. Nine arrangements were measured before that was believed, and the fix that
+had been planned — a third baseline format in a day — was not written. A finding
+that a planner has not seen is a hypothesis.
 
 **And a stability case.** If your rule can be affected by `ANALYZE`, by ordinary
 row growth, or by running twice, `tests/stability.rs` is where that gets proved

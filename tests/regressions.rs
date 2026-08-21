@@ -318,6 +318,109 @@ fn adding_an_index_is_never_a_regression() {
     );
 }
 
+/// A small lookup table joined the way small lookup tables are joined.
+///
+/// The row threshold counts rows read across every execution, so on paper a
+/// forty-row table on the inner side of a loop over five thousand rows should
+/// cross it by repetition and fail somebody's build for a table that fits in a
+/// single page. It does not, because the planner materialises the inner side
+/// rather than re-scanning it, and the count stays at forty.
+///
+/// This is asserted on the *outcome* rather than on the presence of a
+/// `Materialize` node on purpose. If a future planner stops materialising here,
+/// the promise really will have broken, and a red test saying so is the useful
+/// result — the alternative is a threshold quietly failing builds for lookup
+/// tables and nobody finding out.
+fn small_lookup_join(db: &Db) -> &'static str {
+    db.apply(
+        "CREATE TABLE currencies (id int PRIMARY KEY, code text NOT NULL);
+         INSERT INTO currencies SELECT g, 'C' || g FROM generate_series(1, 40) g;
+         CREATE INDEX currencies_code_idx ON currencies (code);
+         CREATE TABLE payments (id int PRIMARY KEY, code text NOT NULL);
+         INSERT INTO payments SELECT g, 'C' || ((g % 40) + 1)
+         FROM generate_series(1, 5000) g;
+         ANALYZE currencies; ANALYZE payments;",
+    );
+    "SELECT count(*) FROM payments p LEFT JOIN currencies c ON c.code = p.code"
+}
+
+#[test]
+fn a_small_table_on_the_inner_side_of_a_loop_never_fails_a_build() {
+    let db = Db::start();
+    let join = small_lookup_join(&db);
+    let looped = "SET enable_hashjoin = off; SET enable_mergejoin = off;";
+
+    let mut first = db.client();
+    first.batch_execute(looped).unwrap();
+    let before = shape(&mut first, join);
+
+    db.apply("DROP INDEX currencies_code_idx;");
+    let mut second = db.client();
+    second.batch_execute(looped).unwrap();
+    let after = shape(&mut second, join);
+
+    assert_eq!(
+        after.sequential_rows.get("currencies"),
+        Some(&40.0),
+        "forty rows are what a forty-row table costs to read; anything larger \
+         means it is being re-scanned per outer row"
+    );
+
+    let found = compare(&before, &after);
+    assert!(
+        !found.iter().any(|r| matches!(
+            r,
+            Regression::SequentialScanAppeared { .. }
+                | Regression::NestedLoopOverSequentialScan { .. }
+        )),
+        "a forty-row lookup table must not fail a build: {found:?}"
+    );
+}
+
+/// The other side of that boundary, so the rule above is understood rather than
+/// taken on trust.
+///
+/// With materialisation switched off the same forty-row table really is read
+/// once per outer row, and two hundred thousand rows really are read. Reporting
+/// that is correct — the threshold is on rows read, and they were read. The
+/// rule is not being lenient about small tables; it is counting honestly, and
+/// the planner is what usually keeps the count small.
+#[test]
+fn the_same_table_genuinely_re_scanned_is_reported() {
+    let db = Db::start();
+    let join = small_lookup_join(&db);
+    let looped = "SET enable_hashjoin = off; SET enable_mergejoin = off; \
+                  SET enable_material = off;";
+
+    let mut first = db.client();
+    first.batch_execute(looped).unwrap();
+    let before = shape(&mut first, join);
+
+    db.apply("DROP INDEX currencies_code_idx;");
+    let mut second = db.client();
+    second.batch_execute(looped).unwrap();
+    let after = shape(&mut second, join);
+
+    let read = after
+        .sequential_rows
+        .get("currencies")
+        .copied()
+        .unwrap_or(0.0);
+    assert!(
+        read > 100_000.0,
+        "without materialisation the table is read once per outer row, so this \
+         should be hundreds of thousands of rows, not {read}"
+    );
+
+    let found = compare(&before, &after);
+    assert!(
+        found
+            .iter()
+            .any(|r| matches!(r, Regression::NestedLoopOverSequentialScan { .. })),
+        "two hundred thousand rows really were read: {found:?}"
+    );
+}
+
 #[test]
 fn a_statement_that_does_not_run_says_what_the_database_said() {
     let db = Db::start();
