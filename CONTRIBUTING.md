@@ -37,14 +37,41 @@ failed**. That is a real category and it is where a rule should start.
 3. **The test in `compare`**, with its threshold as a named constant beside
    `SEQ_SCAN_ROWS` and a comment saying how the number was chosen.
 4. **Whatever `Shape` needs to hold**, in [src/shape.rs](src/shape.rs). Keep it
-   lossy: costs, row *estimates* and tree structure are deliberately not stored,
-   because none of them is comparable between two machines.
+   lossy: costs, row *estimates* and widths are deliberately not stored, because
+   none of them is comparable between two machines.
+
+   **But the shape has to be able to prove what your message says.** That is the
+   harder half of this step and it is where the worst bug in this file's history
+   came from. `NestedLoopOverSequentialScan` said "on its inner side" in a
+   message while testing, from a flat summary, that a `Nested Loop` existed
+   somewhere and that some table was scanned somewhere — two facts usually about
+   different halves of the tree. It missed the case it was named for and fired
+   on a table no loop had touched.
+
+   Tree structure is therefore *mostly* not stored rather than never stored.
+   `inner_loop_rows` is the one exception, it is one flag deep, and it earned
+   its place by being the thing a rule could not do without. If your rule needs
+   another, the bar is the same: name the claim, show the summary cannot carry
+   it, and add the smallest fact that can. Do not soften the message instead —
+   or if you do, soften it honestly, the way `SortAppeared` now states that the
+   sort is new and offers the lost index as the usual cause rather than
+   asserting a link it cannot demonstrate.
 
 ## What it ships with
 
 **A test that provokes it against a real planner**, in `tests/regressions.rs` —
-not hand-written JSON. Two bugs got through review here and were caught only by
-a live server:
+not hand-written JSON, and asserting your variant *by name* rather than that
+something was found. Two of the six once asserted only that the finding list was
+non-empty, which passes when a different rule fires and says nothing about
+yours.
+
+**And its silence.** Every rule needs a case where the same provocation is
+applied to a schema that does not deserve the finding — a forced nested loop
+over a foreign key somebody *did* index, a sequential scan of a small table.
+The catches are what the rule is for; the silences are what decide whether
+anybody leaves it switched on.
+
+Three bugs got through review here and were caught only by a live server:
 
 - a filtered `Seq Scan` reports the rows it **kept**, with the discarded ones in
   `Rows Removed by Filter`, so a full table scan returning ten rows looked like
@@ -53,8 +80,14 @@ a live server:
   the heap scan above it, which made *adding an index* register as a two-fold
   regression.
 
-Neither was reachable from a fixture, because both are facts about what Postgres
-emits rather than about what the docs say it emits.
+- and the planner will not simply do as it is told. A fixture built to force a
+  loop over an unindexed table instead had the child put on the *outside* with a
+  memoized primary-key lookup on the inside, which is the planner being right
+  and the test measuring nothing. A `LEFT JOIN` pins the nullable side inward.
+
+None was reachable from a fixture: the first two are facts about what Postgres
+emits rather than what the docs say it emits, and the third is a fact about what
+it chooses.
 
 **And a stability case.** If your rule can be affected by `ANALYZE`, by ordinary
 row growth, or by running twice, `tests/stability.rs` is where that gets proved
