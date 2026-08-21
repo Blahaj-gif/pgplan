@@ -103,10 +103,29 @@ pub fn compare(before: &Shape, after: &Shape) -> Vec<Regression> {
     // An index the baseline used and this plan does not. Reported per index so
     // the message can name it, which is the difference between a finding and a
     // puzzle.
-    for index in before.indexes.difference(&after.indexes) {
-        found.push(Regression::IndexNoLongerUsed {
-            index: index.clone(),
-        });
+    //
+    // Unless the plan swapped one index for another and came out no worse. A
+    // release that adds a better index and lets the planner move to it loses
+    // the old index's name from this plan, and calling that a regression breaks
+    // the one promise this tool cannot break: that a plan which got better
+    // never fails a build. Measured before it was fixed — a query going from
+    // 900 rows through a broad index to 3 rows through a precise one was
+    // reported as a regression, which is this gate arguing for the slower plan.
+    //
+    // Both halves are needed. An index appearing is not enough on its own,
+    // because a plan can pick one up and still be reading far more than it
+    // was; and reading no more is not enough on its own, because a query that
+    // simply stopped using an index reads no more either. Together they say
+    // the plan reaches its data through an index it did not have before and
+    // is not doing more work to do it, which is the shape of an improvement.
+    let swapped_for_another = after.indexes.difference(&before.indexes).next().is_some()
+        && after.rows_scanned <= before.rows_scanned;
+    if !swapped_for_another {
+        for index in before.indexes.difference(&after.indexes) {
+            found.push(Regression::IndexNoLongerUsed {
+                index: index.clone(),
+            });
+        }
     }
 
     // The accidental quadratic, and the only rule here that needs the plan's
@@ -241,6 +260,51 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Regression::SequentialScanAppeared { .. })),
             "40 rows is the planner being right, not a regression: {found:?}"
+        );
+    }
+
+    /// Swapping a broad index for a precise one is the shape of somebody's
+    /// release going well, and it used to fail their build.
+    ///
+    /// `IndexNoLongerUsed` is a set difference, so the old index's name being
+    /// absent was the whole test. It could not tell an index that was lost from
+    /// one that was replaced by something better — and the second is what a
+    /// migration adding an index looks like from inside a plan.
+    #[test]
+    fn an_index_replaced_by_a_better_one_is_not_a_regression() {
+        let broad = indexed("t", "t_broad_idx", 900.0);
+        let precise = indexed("t", "t_precise_idx", 3.0);
+        let found = compare(&broad, &precise);
+        assert!(
+            found.is_empty(),
+            "900 rows through one index became 3 through another: {found:?}"
+        );
+    }
+
+    /// And the two halves of that guard, each on its own, must not be enough.
+    #[test]
+    fn an_index_replaced_by_a_worse_one_is_still_a_regression() {
+        let precise = indexed("t", "t_precise_idx", 3.0);
+        let broad = indexed("t", "t_broad_idx", 900.0);
+        assert!(
+            compare(&precise, &broad).iter().any(
+                |r| matches!(r, Regression::IndexNoLongerUsed { index } if index == "t_precise_idx")
+            ),
+            "it gained an index and reads three hundred times as much"
+        );
+    }
+
+    #[test]
+    fn an_index_simply_lost_is_still_a_regression() {
+        // Nothing gained, so nothing to have swapped to, however little the
+        // plan happens to read afterwards.
+        let before = indexed("t", "t_idx", 900.0);
+        let after = sequential("t", 5.0);
+        assert!(
+            compare(&before, &after)
+                .iter()
+                .any(|r| matches!(r, Regression::IndexNoLongerUsed { index } if index == "t_idx")),
+            "the index is gone and no other index took its place"
         );
     }
 

@@ -289,6 +289,11 @@ struct Tally {
     /// so it is counted apart rather than folded into a headline.
     named_only_the_index: usize,
     missed: usize,
+    /// The index was dropped, nothing was reported, and the plan had moved to
+    /// another index while reading no more than before. A correct silence, and
+    /// it has to be counted apart from `missed` or removing a false positive
+    /// reads as losing a detection.
+    dropped_swapped: usize,
     /// An ORDER BY that the index used to supply, with the index gone. Counts
     /// the schemas where a `Sort` was named for it.
     sort_tried: usize,
@@ -731,6 +736,7 @@ fn against_schemas_nobody_here_designed() {
         // content: it needs the planner to have actually fallen back to
         // reading the table, and the table to be over the row threshold.
         let (mut named_scan, mut named_index, mut missed, mut undropped) = (0, 0, 0, 0);
+        let mut dropped_swapped = 0;
         for (look, sql, before) in &baselined {
             // Checked, not assumed. A DROP that failed leaves the plan exactly
             // as it was, and scoring that as "pgplan said nothing" would be
@@ -744,7 +750,8 @@ fn against_schemas_nobody_here_designed() {
             }
             let _ = client.batch_execute("ANALYZE;");
             if let Ok(plan) = plan_of(&mut client, sql) {
-                let found = compare(before, &Shape::of(&plan));
+                let after = Shape::of(&plan);
+                let found = compare(before, &after);
                 if found
                     .iter()
                     .any(|r| matches!(r, Regression::SequentialScanAppeared { .. }))
@@ -752,6 +759,13 @@ fn against_schemas_nobody_here_designed() {
                     named_scan += 1;
                 } else if !found.is_empty() {
                     named_index += 1;
+                } else if after.indexes.difference(&before.indexes).next().is_some()
+                    && after.rows_scanned <= before.rows_scanned
+                {
+                    // The index went and the planner moved to another one
+                    // without reading any more. Nothing got worse, so saying
+                    // nothing is right, and it is not a miss.
+                    dropped_swapped += 1;
                 } else {
                     missed += 1;
                 }
@@ -816,11 +830,12 @@ fn against_schemas_nobody_here_designed() {
         total.named_the_scan += named_scan;
         total.named_only_the_index += named_index;
         total.missed += missed;
+        total.dropped_swapped += dropped_swapped;
         total.undropped += undropped;
         total.flapped += flapped;
         total.benign += benign;
         let line = format!(
-            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2} · fk {:>1} loop {loop_named}/{loop_bit} spill {spill_named}/{spill_bit} ratio {ratio_named}/{ratio_scanned}",
+            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · swapped {dropped_swapped:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2} · fk {:>1} loop {loop_named}/{loop_bit} spill {spill_named}/{spill_bit} ratio {ratio_named}/{ratio_scanned}",
             baselined.len(),
             pairs.len()
         );
@@ -847,6 +862,10 @@ fn against_schemas_nobody_here_designed() {
     println!(
         "    only the missing index was named .. {}",
         total.named_only_the_index
+    );
+    println!(
+        "    moved to another index, no more read {}  (correct silence)",
+        total.dropped_swapped
     );
     println!("    nothing was said .................. {}", total.missed);
     if total.undropped > 0 {

@@ -45,16 +45,22 @@ The **wrapped** experiment changes no schema at all. The answer is identical and
 only the plan is worse, so a test that checks results cannot see it — which is
 what makes it the most representative of a real incident.
 
-The dropped result is split in two, because the halves are not equally
-informative:
+The dropped result is split, because dropping an index does not always make a
+plan worse:
 
 - **a sequential scan was named** — the planner actually fell back to reading
   the table, and the table was over the row threshold. This required the plan to
   genuinely degrade.
-- **only the missing index was named** — true by construction the instant the
-  index is dropped, since its name is in the baseline and absent afterwards.
-  Counted separately rather than folded into a headline, because on its own it
-  demonstrates only that a dropped index has a name.
+- **moved to another index, reading no more** — the index went and the planner
+  reached the same data through a different one without doing more work. Nothing
+  can be shown to have got worse, so nothing is reported, and these are held out
+  of the denominator rather than counted as failures to detect.
+
+An earlier version of this page had a third row here, "only the missing index
+was named", and called it weak evidence because it is true by construction the
+moment an index is dropped. That was too kind to it. Those nine were not weak
+evidence of a detection; they were false positives, and the tool was failing
+builds for them. All nine are the row above.
 
 ## Every experiment reports what it could not do
 
@@ -128,10 +134,12 @@ Measured 2026-08-20, PostgreSQL via `postgresql_embedded`, 3,000 rows per table.
 93 candidate lookups had rows behind them
 76 of those were planned through the index — only those are counted
 
-index dropped, of 76
-  a sequential scan was named ....... 67  (88%)
-  only the missing index was named ..  9
-  nothing was said ..................  0
+index dropped, 76 indexes dropped
+  the plan moved to another index and
+    read no more — nothing to report ..  9
+  of the 67 that did degrade:
+    a sequential scan was named ...... 67  (100%)
+    nothing was said .................  0
 
 indexed column wrapped, of 76
   named ............................. 76  (100%)
@@ -156,37 +164,45 @@ reported when nothing got worse
   re-analyzed, column added, index added .  0
 ```
 
-Per schema. `loop`, `spill` and `count` read *named / bit*; `--` means the
-experiment never bit there, which is not a miss.
+Per schema. `swapped` is a drop the planner absorbed by moving to another index,
+which is not a miss. `loop`, `spill` and `count` read *named / bit*; `--` means
+the experiment never bit there, which is also not a miss.
 
-| schema | queries | scan named | index only | fk pairs | loop | spill | count |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| camunda | 6 | 6 | 0 | 1 | -- | 1/1 | 6/6 |
-| discourse | 5 | 5 | 0 | 2 | -- | 2/2 | 5/5 |
-| documenso | 5 | 5 | 0 | 2 | 2/2 | 2/2 | 5/5 |
-| gitlab | 4 | 3 | 1 | 2 | -- | -- | 3/3 |
-| harbor | 2 | 2 | 0 | 0 | -- | -- | 2/2 |
-| hexpm | 6 | 6 | 0 | 2 | 2/2 | 2/2 | 6/6 |
-| hydra | 5 | 5 | 0 | 2 | 1/1 | 2/2 | 5/5 |
-| kratos | 5 | 3 | 2 | 2 | 1/1 | 2/2 | 3/3 |
-| langfuse | 5 | 5 | 0 | 2 | 1/1 | 2/2 | 5/5 |
-| listmonk | 6 | 4 | 2 | 2 | -- | 2/2 | 4/4 |
-| mattermost | 4 | 4 | 0 | 0 | -- | -- | 4/4 |
-| plausible | 3 | 3 | 0 | 2 | -- | 2/2 | 3/3 |
-| powerdns | 3 | 3 | 0 | 2 | -- | 2/2 | 3/3 |
-| sourcegraph | 4 | 3 | 1 | 2 | 2/2 | 2/2 | 3/3 |
-| sourcegraph_codeintel | 4 | 3 | 1 | 2 | -- | 2/2 | 3/3 |
-| sourcegraph_insights | 5 | 4 | 1 | 2 | 2/2 | 2/2 | 4/4 |
-| synapse | 4 | 3 | 1 | 2 | 1/1 | 2/2 | 3/3 |
+| schema | queries | scan named | swapped | missed | fk pairs | loop | spill | count |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| camunda | 6 | 6 | 0 | 0 | 1 | -- | 1/1 | 6/6 |
+| discourse | 5 | 5 | 0 | 0 | 2 | -- | 2/2 | 5/5 |
+| documenso | 5 | 5 | 0 | 0 | 2 | 2/2 | 2/2 | 5/5 |
+| gitlab | 4 | 3 | 1 | 0 | 2 | -- | -- | 3/3 |
+| harbor | 2 | 2 | 0 | 0 | 0 | -- | -- | 2/2 |
+| hexpm | 6 | 6 | 0 | 0 | 2 | 2/2 | 2/2 | 6/6 |
+| hydra | 5 | 5 | 0 | 0 | 2 | 1/1 | 2/2 | 5/5 |
+| kratos | 5 | 3 | 2 | 0 | 2 | 1/1 | 2/2 | 3/3 |
+| langfuse | 5 | 5 | 0 | 0 | 2 | 1/1 | 2/2 | 5/5 |
+| listmonk | 6 | 4 | 2 | 0 | 2 | -- | 2/2 | 4/4 |
+| mattermost | 4 | 4 | 0 | 0 | 0 | -- | -- | 4/4 |
+| plausible | 3 | 3 | 0 | 0 | 2 | -- | 2/2 | 3/3 |
+| powerdns | 3 | 3 | 0 | 0 | 2 | -- | 2/2 | 3/3 |
+| sourcegraph | 4 | 3 | 1 | 0 | 2 | 2/2 | 2/2 | 3/3 |
+| sourcegraph_codeintel | 4 | 3 | 1 | 0 | 2 | -- | 2/2 | 3/3 |
+| sourcegraph_insights | 5 | 4 | 1 | 0 | 2 | 2/2 | 2/2 | 4/4 |
+| synapse | 4 | 3 | 1 | 0 | 2 | 1/1 | 2/2 | 3/3 |
 
 Every degradation that actually occurred produced a finding. Nothing was
 reported when nothing got worse.
 
-The two halves of the `counted` experiment line up exactly, which is worth
-noticing: 67 counts fell back to a sequential scan and 67 were reported, and the
-9 that did not fall back are the same 9 where the dropped-index experiment named
-only the index. 67 + 9 = 76. The first run of that experiment reported "67 of
-76" and it read as nine misses. There were none.
+The same nine appear in every experiment that drops an index, and they are the
+same nine each time: 76 indexes dropped, 67 plans that degraded, 9 the planner
+absorbed by reaching the data another way. 67 counts fell back to a sequential
+scan and 67 were reported; the 9 that did not fall back are those nine. 67 + 9 =
+76, three times over.
+
+Both of the errors that number has been through are worth keeping in view,
+because they point in opposite directions. The `counted` experiment first
+reported "67 of 76" and it read as nine misses — too harsh. The dropped-index
+experiment reported the same nine as findings — too lenient, and failing builds
+for them. One denominator, wrong twice, in both directions, before anybody
+looked at what the nine actually were.
 
 ## What this does not show
 
@@ -228,6 +244,13 @@ denominator is pairs rather than schemas.
 result rests on 12. One of those 12 was on a pair whose referencing column *was*
 indexed — the planner chose to scan it anyway — which is a reminder that the
 index is a strong predictor of the shape and not a guarantee either way.
+
+**`IndexNoLongerUsed` is now suppressed when the plan swapped indexes.** The
+criterion is the tool's own: the plan reaches its data through an index it did
+not have before, and reads no more rows than it did. That is not a proof the new
+plan is *faster* — it is the absence of any demonstrable degradation, which is
+the standard this whole project holds itself to and the reason the finding is
+withheld. Nine of the corpus's dropped indexes fall in that bucket.
 
 **`SortAppeared` fires on a proxy.** It requires a new sort and *some* table
 reached through *some* index in the baseline; it cannot show that the index in
@@ -357,13 +380,35 @@ test wrote `Hash Batches` on the `Hash Join` node; a real planner puts it on the
 `Hash` node below. The test passed anyway, which is a fixture agreeing with its
 author inside the file arguing against exactly that.
 
-The two remaining probes are recorded and not yet fixed, because both need the
-shape to carry more than it does. `IndexNoLongerUsed` cannot tell an index being
-*swapped for a better one* from an index being lost, which breaks the promise
-that a better plan never fails a build; telling them apart needs the shape to
-know which table each index belonged to. And `SequentialScanAppeared` sums rows
-across loops, so a forty-row table scanned forty times crosses a threshold whose
-stated purpose is "the table is big enough for this to matter".
+**A third, and the plan for it that turned out to be wrong.**
+`IndexNoLongerUsed` could not tell an index being *swapped for a better one*
+from an index being lost. It is a set difference over index names, so a release
+that adds a better index and lets the planner move to it loses the old name and
+was reported as a regression — measured, a query going from 900 rows through a
+broad index to 3 through a precise one. That is this gate arguing for the slower
+plan, against the one promise it cannot break.
+
+The intended fix was to make the shape know which table each index served, at
+the cost of a third baseline format in a day. That was unnecessary, and noticing
+so was worth more than the fix: the question is not *which table did this index
+serve* but *did the plan come out worse*, and the shape already answers that. It
+now withholds the finding when the plan gained an index it did not have and
+reads no more rows than before — both halves required, since a plan can pick up
+an index and still be reading far more, and a plan that simply stopped using one
+also reads no more.
+
+On the corpus this removed nine findings and cost none: every other figure on
+this page is unchanged, including the wrapped experiment's 76 of 76. It also
+corrected the headline in the other direction, because those nine had been
+sitting in the denominator of the dropped-index result and understating it. 67
+of 76 was never the number. 67 of 67 is.
+
+**`SequentialScanAppeared` remains unfixed and is recorded.** It sums rows across
+loops, so a forty-row table scanned forty times reads 1,600 and crosses a
+threshold whose stated purpose is "the table is big enough for this to matter".
+Both that rule and the nested-loop rule fire on such a plan, and only one of
+them has the right story: the remedy `SequentialScanAppeared` implies is an
+index, and the actual problem is the loop.
 
 ## What this survey found in pgseed
 

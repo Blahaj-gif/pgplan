@@ -158,13 +158,16 @@ Mattermost, Synapse and others — seeded by [pgseed][pgseed] at volume and
 queried on indexes those projects chose for themselves. All six named
 regressions are exercised there, three of them only since the joins were added.
 
-Of 76 queries the planner routed through an index, then degraded four ways:
+Of 76 queries the planner routed through an index, then degraded four ways.
+Dropping an index does not always make a plan worse — nine times the planner
+reached the same data through another index without reading more, and those are
+held out rather than counted as failures to detect:
 
 | | | |
 |---|---:|---:|
-| the index dropped, a sequential scan named | **67** | (88%) |
-| the index dropped, only the index named | 9 | |
-| the index dropped, nothing said | **0** | |
+| the index dropped, the plan absorbed it | 9 | *nothing to report* |
+| of the 67 that degraded, a sequential scan named | **67** | (100%) |
+| of the 67 that degraded, nothing said | **0** | |
 | the column wrapped so the index cannot serve it | **76** | (100%) |
 | an `ORDER BY` the index supplied, a sort named | **68 of 75** | (91%) |
 | a `count(*)` whose index went, of the 67 that fell back to a scan | **67** | (100%) |
