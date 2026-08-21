@@ -129,35 +129,37 @@ Measured 2026-08-21, PostgreSQL via `postgresql_embedded`, 3,000 rows per table.
 
 ```
 24 schema files read
-17 produced a query
- 0 could not be measured
-93 candidate lookups had rows behind them
-76 of those were planned through the index — only those are counted
+18 produced a lookup query
+21 produced a join
+ 3 produced neither
+99 candidate lookups had rows behind them
+81 of those were planned through the index — only those are counted
 
-index dropped, 76 indexes dropped
+index dropped, 81 indexes dropped
   the plan moved to another index and
     read no more — nothing to report ..  9
-  of the 67 that did degrade:
-    a sequential scan was named ...... 67  (100%)
+  of the 72 that did degrade:
+    a sequential scan was named ...... 72  (100%)
     nothing was said .................  0
 
-indexed column wrapped, of 76
-  named ............................. 76  (100%)
+indexed column wrapped, of 81
+  named ............................. 81  (100%)
 
-ORDER BY an index was supplying, index dropped, of 75
-  a sort was named .................. 68  (91%)
+ORDER BY an index was supplying, index dropped, of 80
+  a sort was named .................. 73  (91%)
 
-count(*) through an index that was then dropped, 76 tried
-  the count fell back to a scan ..... 67
-  read far more for the same answer . 67  (100% of the ones that fell back)
+count(*) through an index that was then dropped, 81 tried
+  the count fell back to a scan ..... 72
+  read far more for the same answer . 72  (100% of the ones that fell back)
 
-joins, from 29 foreign-key pairs with rows on both sides
-  15 had no index on the referencing column
-  forced onto a nested loop ......... 12 of 29 put a sequential scan on the
-                                      inner side; all 12 were named
-  work_mem at the floor ............. 29 of 29 actually spilled;
-                                      all 29 were named
-                                      (27-29 across five runs; see below)
+joins, from 41 foreign-key pairs with rows on both sides
+  30 had no index on the referencing column
+  forced onto a nested loop ......... 22 of 41 put a sequential scan on the
+                                      inner side, none of them on a pair whose
+                                      key was indexed; all 22 were named
+  work_mem at the floor ............. 39 of 41 actually spilled;
+                                      all 39 were named
+                                      (29-39 across six runs; see below)
   could not be run at all ...........  0
 
 reported when nothing got worse
@@ -165,32 +167,38 @@ reported when nothing got worse
   re-analyzed, column added, index added .  0
 ```
 
-Per schema. `swapped` is a drop the planner absorbed by moving to another index,
-which is not a miss. `loop`, `spill` and `count` read *named / bit*; `--` means
-the experiment never bit there, which is also not a miss.
+Per schema, all twenty-four. `--` under queries means the schema offered no
+lookup index and contributed joins only; `--` under an experiment means it never
+bit there, which is not a miss. `swapped` is a drop the planner absorbed by
+moving to another index, which is also not a miss. `loop`, `spill` and `count`
+read *named / bit*.
 
-| schema | queries | scan named | swapped | missed | fk pairs | loop | spill | count |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| camunda | 6 | 6 | 0 | 0 | 1 | -- | 1/1 | 6/6 |
-| discourse | 5 | 5 | 0 | 0 | 2 | -- | 2/2 | 5/5 |
-| documenso | 5 | 5 | 0 | 0 | 2 | 2/2 | 2/2 | 5/5 |
-| gitlab | 4 | 3 | 1 | 0 | 2 | -- | 2/2 | 3/3 |
-| harbor | 2 | 2 | 0 | 0 | 0 | -- | -- | 2/2 |
-| hexpm | 6 | 6 | 0 | 0 | 2 | 2/2 | 2/2 | 6/6 |
-| hydra | 5 | 5 | 0 | 0 | 2 | 1/1 | 2/2 | 5/5 |
-| kratos | 5 | 3 | 2 | 0 | 2 | 1/1 | 2/2 | 3/3 |
-| langfuse | 5 | 5 | 0 | 0 | 2 | 1/1 | 2/2 | 5/5 |
-| listmonk | 6 | 4 | 2 | 0 | 2 | -- | 2/2 | 4/4 |
-| mattermost | 4 | 4 | 0 | 0 | 0 | -- | -- | 4/4 |
-| plausible | 3 | 3 | 0 | 0 | 2 | -- | 2/2 | 3/3 |
-| powerdns | 3 | 3 | 0 | 0 | 2 | -- | 2/2 | 3/3 |
-| sourcegraph | 4 | 3 | 1 | 0 | 2 | 2/2 | 2/2 | 3/3 |
-| sourcegraph_codeintel | 4 | 3 | 1 | 0 | 2 | -- | 2/2 | 3/3 |
-| sourcegraph_insights | 5 | 4 | 1 | 0 | 2 | 2/2 | 2/2 | 4/4 |
-| synapse | 4 | 3 | 1 | 0 | 2 | 1/1 | 2/2 | 3/3 |
-
-Every degradation that actually occurred produced a finding. Nothing was
-reported when nothing got worse.
+| schema | queries | scan named | swapped | fk pairs | loop | spill | count |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| camunda | 6 | 6 | 0 | 2 | -- | 2/2 | 6/6 |
+| discourse | 5 | 5 | 0 | 2 | -- | 2/2 | 5/5 |
+| documenso | 5 | 5 | 0 | 2 | 2/2 | 2/2 | 5/5 |
+| gitlab | 4 | 3 | 1 | 2 | -- | -- | 3/3 |
+| harbor | 2 | 2 | 0 | 2 | 1/1 | 2/2 | 2/2 |
+| hasura | -- | -- | -- | 0 | -- | -- | -- |
+| hexpm | 6 | 6 | 0 | 2 | 2/2 | 2/2 | 6/6 |
+| hydra | 5 | 5 | 0 | 2 | 1/1 | 2/2 | 5/5 |
+| kong | -- | -- | -- | 2 | 2/2 | 2/2 | -- |
+| kratos | 5 | 3 | 2 | 2 | 1/1 | 2/2 | 3/3 |
+| lago | 5 | 5 | 0 | 2 | 2/2 | 2/2 | 5/5 |
+| langfuse | 5 | 5 | 0 | 2 | 2/2 | 2/2 | 5/5 |
+| listmonk | 6 | 4 | 2 | 2 | -- | 2/2 | 4/4 |
+| mattermost | 4 | 4 | 0 | 1 | -- | 1/1 | 4/4 |
+| plausible | 3 | 3 | 0 | 2 | 2/2 | 2/2 | 3/3 |
+| postgrest | -- | -- | -- | 2 | 1/1 | 2/2 | -- |
+| powerdns | 3 | 3 | 0 | 2 | -- | 2/2 | 3/3 |
+| sourcegraph | 4 | 3 | 1 | 2 | 2/2 | 2/2 | 3/3 |
+| sourcegraph_codeintel | 4 | 3 | 1 | 2 | -- | 2/2 | 3/3 |
+| sourcegraph_insights | 5 | 4 | 1 | 2 | 2/2 | 2/2 | 4/4 |
+| synapse | 4 | 3 | 1 | 2 | 1/1 | 2/2 | 3/3 |
+| temporal | -- | -- | -- | 0 | -- | -- | -- |
+| vaultwarden | -- | -- | -- | 2 | 1/1 | 2/2 | -- |
+| zitadel | -- | -- | -- | 0 | -- | -- | -- |
 
 The same nine appear in every experiment that drops an index, and they are the
 same nine each time: 76 indexes dropped, 67 plans that degraded, 9 the planner
@@ -210,46 +218,59 @@ looked at what the nine actually were.
 Stated because a survey that reports only its coverage reports the coverage of
 the easy cases as if it were the coverage of all of them.
 
-**Seven of twenty-four schemas produced no measurement.** They offer no
-non-unique single-column index on an ordinary scalar type, so there was no
-lookup of the shape an application issues: hasura, kong, lago, postgrest,
-temporal, vaultwarden, zitadel.
+**Three of twenty-four schemas produced no measurement**: hasura, temporal and
+zitadel. The reasons differ and are worth separating, because an earlier version
+of this page gave one reason for seven schemas and it was wrong for four of them.
 
-That exclusion is wider than it looks, because seeding is driven by the lookup
-search: a schema with no ordinary lookup index is never seeded, so **its joins
-are never reached either**. postgrest is the sharpest case — all thirteen of its
-foreign-key columns are unindexed, which is exactly the material the loop
-experiment wants, and none of it is measured.
+- **temporal** loads thirty-seven tables and declares no foreign keys at all,
+  and offers no non-unique single-column index on a scalar type. An honest
+  negative.
+- **hasura** gets two tables out of eight, because the rest depend on objects a
+  bare server does not have. Small enough to offer nothing either way.
+- **zitadel** loads thirty tables and pgseed writes no rows into any of them, so
+  nothing has rows behind an index. Why is not established here — it is pgseed's
+  answer rather than pgplan's, and it is recorded as a gap rather than
+  explained.
+
+**Three more contribute joins but no lookups**: kong, postgrest and vaultwarden
+offer no non-unique single-column index on a scalar type, so there is no lookup
+of the shape an application issues, but they are full of foreign keys and are
+now seeded and joined on that basis.
+
+**At most two foreign-key pairs are taken from any one schema.** That is a
+deliberate bound on runtime, not a property of the corpus: postgrest alone
+offers fifty pairs and contributes two. The join numbers are therefore a sample
+across many schemas rather than a census of any, and raising the bound would
+mean seeding more tables per schema — GitLab already spends seven of its
+ten-minute budget seeding.
 
 **Seventeen of ninety-three candidates were discarded before the experiment**,
 because the planner did not route them through the index even with it present.
 A query already being scanned sequentially cannot regress that way, and counting
 it would have flattered the result.
 
-**The spill experiment's denominator is not stable between runs.** Across five
-runs of identical code against identical seeded data it bit 27, 29, 27, 27 and
-29 times out of 29, and the movement is always the same two GitLab pairs. It is
+**The spill experiment's denominator is not stable between runs.** Across six
+runs it bit 27, 29, 27, 27, 29 and — once the survey was widened — 39 of 41. The
+movement between runs of *identical* code is always the same two GitLab pairs. It is
 not errors or timeouts — the survey counts those separately and has reported
 zero every time. The likely cause is that `ANALYZE` samples rather than reading
 every row, so column statistics differ a little between runs and the planner's
 hash-batch decision moves with them; that is offered as the likely cause rather
 than a demonstrated one.
 
-What did not move, in any of the five: pgplan named **every** bite, and every
-other figure on this page was identical. The denominator wobbles; the detection
-rate does not. It is reported as a range rather than averaged into one tidy
+What did not move, in any of the six: pgplan named **every** bite. The
+denominator wobbles; the detection rate does not. It is reported as a range rather than averaged into one tidy
 number, because the tidy number would be the only part of this page that nobody
 measured.
 
-**Two schemas offered no foreign-key pair at all** with rows on both sides:
-harbor and mattermost. Mattermost declares almost no foreign keys, which is a
-fact about Mattermost rather than about this tool, and it is why the join
-denominator is pairs rather than schemas.
+**The join denominator is pairs rather than schemas** because schemas differ
+wildly in how many they offer. Mattermost declares almost no foreign keys and
+contributes one pair; postgrest could contribute fifty and is capped at two.
 
-**Seventeen of the 29 pairs never produced the loop shape**, so the nested-loop
-result rests on 12. One of those 12 was on a pair whose referencing column *was*
-indexed — the planner chose to scan it anyway — which is a reminder that the
-index is a strong predictor of the shape and not a guarantee either way.
+**Nineteen of the 41 pairs never produced the loop shape**, so the nested-loop
+result rests on 22. All 22 were on pairs whose referencing column nobody had
+indexed, which is the expected direction and worth stating as a measurement
+rather than an assumption.
 
 **`IndexNoLongerUsed` is now suppressed when the plan swapped indexes.** The
 criterion is the tool's own: the plan reaches its data through an index it did
@@ -269,11 +290,11 @@ choice, and a column filled with deterministic synthetic values does not have
 production's distribution. This measures the pair — pgseed's data and pgplan's
 judgement — on real *schemas*, not on real *data*.
 
-## Six ways this survey was wrong before it was right
+## Seven ways this survey was wrong before it was right
 
 Each produced a plausible number that was wrong in a different direction, which
-is the argument for not publishing the first result a harness gives you. Five of
-the six share one shape: **an experiment that did not bite is indistinguishable
+is the argument for not publishing the first result a harness gives you. Six of
+the seven share one shape: **an experiment that did not bite is indistinguishable
 from a tool that missed something**, unless you check.
 
 1. **It never finished.** The first version seeded 2,000 rows into all 1,057
@@ -318,8 +339,34 @@ from a tool that missed something**, unless you check.
    turned out to be zero, which means the wobble is the planner's and is
    described above; but that was worth knowing rather than assuming.
 
+7. **It could not read three of the schemas, and said they had nothing to
+   offer.** Lago, Hasura and Zitadel were each reported as offering no
+   indexable lookup. None of them had been loaded. Two separate faults, one
+   shape:
+
+   The statement splitter toggled "inside a function body" once per *line*
+   containing `$$`. Lago has a trigger written on a single line — `AS $$ BEGIN
+   ... END; $$;` — which carries two, so the toggle stuck, and every one of the
+   139 `CREATE TABLE` statements after it accumulated into a single blob that
+   began with neither CREATE nor ALTER and was filtered out on that basis. The
+   same fault was truncating PostgREST, which went from 445 statements to 762
+   once it was fixed, and 86 tables to 223.
+
+   And a dump that writes `CREATE TABLE hdb_catalog.hdb_version (...)` fails
+   outright against a bare server, because nothing creates the schema. The
+   harness tolerates statement failures by design — production dumps reference
+   roles and extensions that are not there — so all thirteen of Hasura's
+   statements failed and the empty database was measured as an empty database.
+   Zitadel lost all thirty of its tables the same way.
+
+   Both were invisible because the survey only ever asked what a loaded schema
+   contained, never whether it had loaded. It now creates the schemas a dump
+   writes into, counts `$$` per occurrence, and Lago contributes a full
+   measurement while Kong, PostgREST and Vaultwarden contribute joins.
+
 The harness now excludes constraint-backed indexes, verifies that each drop
-actually happened, uses a wrap that bites on every candidate type, reports a
+actually happened, creates the schemas a dump writes into, counts dollar quotes
+per occurrence rather than per line, uses a wrap that bites on every candidate type, reports a
 bite measure for each of the three experiments that can decline to bite,
 separates "could not be run" from "did not bite", and prints every denominator
 so that none of them is implied.

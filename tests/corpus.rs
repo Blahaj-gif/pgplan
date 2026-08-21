@@ -66,6 +66,52 @@ fn shapes_the_schema(statement: &str) -> bool {
     .any(|allowed| head.starts_with(allowed))
 }
 
+/// Schemas a set of statements writes into, so they can be created first.
+///
+/// A dump that says `CREATE TABLE hdb_catalog.hdb_version (...)` fails outright
+/// against a bare server, and the harness tolerates statement failures by
+/// design — so the schema simply came out empty and was reported as offering no
+/// indexable lookup. It offered eight tables. Hasura and Zitadel were both lost
+/// this way, and neither had anything wrong with it.
+fn schemas_written_to(statements: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for statement in statements {
+        let head = statement.trim_start();
+        let upper = head.to_uppercase();
+        let rest = if let Some(rest) = upper.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+            &head[head.len() - rest.len()..]
+        } else if let Some(rest) = upper.strip_prefix("CREATE TABLE ") {
+            &head[head.len() - rest.len()..]
+        } else {
+            continue;
+        };
+        // Scanned rather than split, because a quoted identifier may contain
+        // the space or the dot that a naive split would stop on, and a schema
+        // missed here is a schema that comes out empty and gets reported as
+        // offering nothing.
+        let mut qualifier = String::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut qualified = false;
+        for c in rest.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                '.' if !quoted && !qualified => {
+                    qualifier = std::mem::take(&mut current);
+                    qualified = true;
+                }
+                c if !quoted && (c.is_whitespace() || c == '(') => break,
+                c => current.push(c),
+            }
+        }
+        if !qualified || qualifier.is_empty() || qualifier.eq_ignore_ascii_case("public") {
+            continue;
+        }
+        out.insert(qualifier);
+    }
+    out
+}
+
 fn statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -76,7 +122,15 @@ fn statements(sql: &str) -> Vec<String> {
         if !quoted && !in_body && (trimmed.starts_with("--") || trimmed.is_empty()) {
             continue;
         }
-        if line.contains("$$") {
+        // Per occurrence, not per line. A function written on one line — `AS $$
+        // BEGIN ... END; $$;` — carries two, and toggling once left the parser
+        // convinced it was inside a body for the rest of the file. Everything
+        // after it accumulated into a single statement that started with
+        // neither CREATE nor ALTER and was filtered out on that basis, so Lago
+        // contributed all 139 of its tables to nothing and was reported as a
+        // schema with no indexable lookup. A parse failure wearing the costume
+        // of a measurement.
+        if line.matches("$$").count() % 2 == 1 {
             in_body = !in_body;
         }
         if in_body {
@@ -208,7 +262,7 @@ struct Pair {
     indexed: bool,
 }
 
-fn related(client: &mut postgres::Client, limit: usize) -> Vec<Pair> {
+fn related(client: &mut postgres::Client, limit: usize, needs_rows: bool) -> Vec<Pair> {
     let rows = client
         .query(
             "SELECT c.relname, a.attname, p.relname, pa.attname,
@@ -226,10 +280,11 @@ fn related(client: &mut postgres::Client, limit: usize) -> Vec<Pair> {
                AND c.relkind = 'r' AND p.relkind = 'r'
                AND c.oid <> p.oid
                -- Both sides have to have been seeded. A join against an empty
-               -- table plans as nothing and measures nothing.
-               AND c.reltuples > 500 AND p.reltuples > 500
+               -- table plans as nothing and measures nothing. Asked without
+               -- that clause before seeding, to decide what is worth seeding.
+               AND (NOT $1 OR (c.reltuples > 500 AND p.reltuples > 500))
              ORDER BY 5, p.reltuples DESC, c.relname",
-            &[],
+            &[&needs_rows],
         )
         .unwrap_or_default();
 
@@ -302,6 +357,11 @@ struct Tally {
     /// Nothing is dropped: this is the innocent-looking ORM change.
     wrapped_tried: usize,
     wrapped_named: usize,
+    /// Schemas that contributed at least one foreign-key pair, whether or not
+    /// they also offered a lookup. Reported beside `schemas` because widening
+    /// the survey to joins is worth nothing if it is not visible how much it
+    /// widened it.
+    schemas_joined: usize,
     /// Foreign-key pairs found with rows on both sides — the denominator for
     /// the three join experiments below.
     pairs: usize,
@@ -394,11 +454,16 @@ fn against_schemas_nobody_here_designed() {
         // Statement failures are tolerated: a production dump references
         // extensions and roles a bare server does not have, and the point is
         // to get a large real schema into a database, not to replay it.
-        for statement in statements(&sql)
+        let shaping: Vec<String> = statements(&sql)
             .into_iter()
             .filter(|s| shapes_the_schema(s))
-        {
-            let _ = client.batch_execute(&statement);
+            .collect();
+        for schema in schemas_written_to(&shaping) {
+            let _ =
+                client.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote(&schema)));
+        }
+        for statement in &shaping {
+            let _ = client.batch_execute(statement);
         }
         let _ = client.batch_execute("SET search_path TO public;");
         let ddl = began.elapsed().as_secs();
@@ -410,8 +475,17 @@ fn against_schemas_nobody_here_designed() {
         // measurement only needs a handful of tables deep enough that a
         // sequential scan of one is expensive.
         let wanted = lookups(&mut client, 6, false);
-        if wanted.is_empty() {
-            let line = format!("  {name:<24} ddl {ddl:>3}s · no indexable lookup");
+        // And the tables a join needs, asked for before seeding for the same
+        // reason. Three of the six named regressions are about joins, and a
+        // schema can be full of foreign keys while offering no lookup index at
+        // all — Kong, PostgREST and Vaultwarden have eighty-nine pairs between
+        // them and not one qualifying lookup. Seeding only what a lookup needed
+        // meant those schemas were never filled, so their joins were never
+        // planned, and the survey called them schemas with nothing to offer.
+        let pairs_wanted = related(&mut client, 2, false);
+        if wanted.is_empty() && pairs_wanted.is_empty() {
+            let line =
+                format!("  {name:<24} ddl {ddl:>3}s · no indexable lookup and no related pair");
             println!("{line}");
             per_schema.push(line);
             continue;
@@ -430,9 +504,17 @@ fn against_schemas_nobody_here_designed() {
                 "--allow-nonempty".into(),
                 "--probe".into(),
             ];
-            for look in &wanted {
+            let mut fill: BTreeSet<String> = wanted.iter().map(|l| l.table.clone()).collect();
+            for pair in &pairs_wanted {
+                // Both sides named explicitly. pgseed widens to a child's
+                // ancestors on its own, but saying so costs nothing and does
+                // not rely on that staying true.
+                fill.insert(pair.child.clone());
+                fill.insert(pair.parent.clone());
+            }
+            for table in &fill {
                 args.push("--include".into());
-                args.push(look.table.clone());
+                args.push(table.clone());
             }
             seeded = match std::process::Command::new(&seeder)
                 .args(&args)
@@ -459,10 +541,144 @@ fn against_schemas_nobody_here_designed() {
         let _ = client.batch_execute("ANALYZE;");
         let seed = began.elapsed().as_secs() - ddl;
 
+        // Experiments five and six need two tables that are actually related,
+        // because three of the six named regressions are about joins and a
+        // single-table lookup cannot provoke any of them. Postgres does not
+        // index a foreign key, so the referencing side is usually unindexed —
+        // which is the whole reason the shape below is a real incident rather
+        // than a curiosity.
+        let pairs = related(&mut client, 2, true);
+        let (mut loop_tried, mut loop_bit, mut loop_named) = (0, 0, 0);
+        let (mut pairs_unplanned, mut joins_could_not_run) = (0, 0);
+        let mut loop_bit_indexed = 0;
+        let (mut spill_tried, mut spill_bit, mut spill_named) = (0, 0, 0);
+        // A join that goes quadratic can take a long time to *run*, and
+        // EXPLAIN ANALYZE runs it. One schema stalling must not cost the rest.
+        let _ = client.batch_execute("SET statement_timeout = '60s'");
+        for pair in &pairs {
+            // The parent on the left, so the child is the nullable side and
+            // the planner has to put it on the inside of any loop it chooses.
+            // Without that it is free to swap them, and on the schemas here it
+            // does: it put the child on the outside and memoized a primary-key
+            // lookup on the inside, which is the planner being right.
+            let join = format!(
+                "SELECT count(*) FROM {} p LEFT JOIN {} c ON c.{} = p.{}",
+                quote(&pair.parent),
+                quote(&pair.child),
+                quote(&pair.key),
+                quote(&pair.referenced)
+            );
+            let Ok(plan) = plan_of(&mut client, &join) else {
+                pairs_unplanned += 1;
+                continue;
+            };
+            let before = Shape::of(&plan);
+
+            // Experiment five: the same join, planned as a loop. The row
+            // estimate is not what is manipulated — inducing a bad estimate on
+            // twenty-four unfamiliar schemas is its own project — so the join
+            // methods are switched off, which arrives at the same plan by a
+            // different route. What is measured is whether the shape is
+            // recognised when it appears, not how often it appears.
+            loop_tried += 1;
+            let _ = client.batch_execute("SET enable_hashjoin = off; SET enable_mergejoin = off;");
+            let looped = plan_of(&mut client, &join);
+            if looped.is_err() {
+                joins_could_not_run += 1;
+            }
+            if let Ok(plan) = looped {
+                let after = Shape::of(&plan);
+                // The worst inner scan in the plan, against the same row floor
+                // the rule uses. Counting a bite the rule is *right* to ignore
+                // would make this harness fail the build for pgplan being
+                // correct on a small table — which is the exact failure this
+                // whole project is built to avoid, arriving from inside its own
+                // evidence. Borrowed from the crate rather than restated, so
+                // the two cannot drift apart.
+                let worst = after
+                    .inner_loop_rows
+                    .values()
+                    .copied()
+                    .fold(0.0_f64, f64::max);
+                if worst < SEQ_SCAN_ROWS {
+                    // Either the planner found something better even with two
+                    // join methods gone, or the inner side is small enough that
+                    // scanning it is the right answer. Nothing to detect.
+                } else {
+                    loop_bit += 1;
+                    if pair.indexed {
+                        loop_bit_indexed += 1;
+                    }
+                    if compare(&before, &after)
+                        .iter()
+                        .any(|r| matches!(r, Regression::NestedLoopOverSequentialScan { .. }))
+                    {
+                        loop_named += 1;
+                    }
+                }
+            }
+            let _ = client.batch_execute("RESET enable_hashjoin; RESET enable_mergejoin;");
+
+            // Experiment six: the same join with work_mem at the floor, which
+            // is what a busy machine and a grown table look like together.
+            spill_tried += 1;
+            let _ = client.batch_execute("SET work_mem = '64kB'");
+            let cramped = plan_of(&mut client, &join);
+            if cramped.is_err() {
+                joins_could_not_run += 1;
+            }
+            if let Ok(plan) = cramped {
+                let after = Shape::of(&plan);
+                // Mirrors the rule, including its guard that the baseline
+                // actually had a hash join to fit in memory. A bite measure
+                // that outlives the rule it measures is not a bite measure.
+                if before.nodes.contains("Hash Join")
+                    && before.max_batches <= 1
+                    && after.max_batches > 1
+                {
+                    spill_bit += 1;
+                    if compare(&before, &after)
+                        .iter()
+                        .any(|r| matches!(r, Regression::HashJoinSpilled { .. }))
+                    {
+                        spill_named += 1;
+                    }
+                }
+            }
+            let _ = client.batch_execute("RESET work_mem");
+        }
+        let _ = client.batch_execute("RESET statement_timeout");
+
+        total.pairs += pairs.len();
+        total.pairs_unplanned += pairs_unplanned;
+        total.joins_could_not_run += joins_could_not_run;
+        total.pairs_unindexed += pairs.iter().filter(|pair| !pair.indexed).count();
+        total.loop_tried += loop_tried;
+        total.loop_bit += loop_bit;
+        total.loop_named += loop_named;
+        total.loop_bit_indexed += loop_bit_indexed;
+        total.spill_tried += spill_tried;
+        total.spill_bit += spill_bit;
+        total.spill_named += spill_named;
+        if !pairs.is_empty() {
+            total.schemas_joined += 1;
+        }
+        // One phrase for the per-schema line, so a schema that contributed
+        // only joins still says what it contributed.
+        let joins = if pairs.is_empty() {
+            "fk 0".to_string()
+        } else {
+            format!(
+                "fk {} loop {loop_named}/{loop_bit} spill {spill_named}/{spill_bit}",
+                pairs.len()
+            )
+        };
+
         let found = lookups(&mut client, 6, true);
         if found.is_empty() {
-            let line =
-                format!("  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · no rows behind an index");
+            let line = format!(
+                "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · no rows behind an index · {joins}"
+            );
             println!("{line}");
             per_schema.push(line);
             continue;
@@ -491,7 +707,7 @@ fn against_schemas_nobody_here_designed() {
         }
         if baselined.is_empty() {
             let line = format!(
-                "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · nothing planned through an index"
+                "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · nothing planned through an index · {joins}"
             );
             println!("{line}");
             per_schema.push(line);
@@ -595,114 +811,6 @@ fn against_schemas_nobody_here_designed() {
                 }
             }
         }
-
-        // Experiments five and six need two tables that are actually related,
-        // because three of the six named regressions are about joins and a
-        // single-table lookup cannot provoke any of them. Postgres does not
-        // index a foreign key, so the referencing side is usually unindexed —
-        // which is the whole reason the shape below is a real incident rather
-        // than a curiosity.
-        let pairs = related(&mut client, 2);
-        let (mut loop_tried, mut loop_bit, mut loop_named) = (0, 0, 0);
-        let (mut pairs_unplanned, mut joins_could_not_run) = (0, 0);
-        let mut loop_bit_indexed = 0;
-        let (mut spill_tried, mut spill_bit, mut spill_named) = (0, 0, 0);
-        // A join that goes quadratic can take a long time to *run*, and
-        // EXPLAIN ANALYZE runs it. One schema stalling must not cost the rest.
-        let _ = client.batch_execute("SET statement_timeout = '60s'");
-        for pair in &pairs {
-            // The parent on the left, so the child is the nullable side and
-            // the planner has to put it on the inside of any loop it chooses.
-            // Without that it is free to swap them, and on the schemas here it
-            // does: it put the child on the outside and memoized a primary-key
-            // lookup on the inside, which is the planner being right.
-            let join = format!(
-                "SELECT count(*) FROM {} p LEFT JOIN {} c ON c.{} = p.{}",
-                quote(&pair.parent),
-                quote(&pair.child),
-                quote(&pair.key),
-                quote(&pair.referenced)
-            );
-            let Ok(plan) = plan_of(&mut client, &join) else {
-                pairs_unplanned += 1;
-                continue;
-            };
-            let before = Shape::of(&plan);
-
-            // Experiment five: the same join, planned as a loop. The row
-            // estimate is not what is manipulated — inducing a bad estimate on
-            // twenty-four unfamiliar schemas is its own project — so the join
-            // methods are switched off, which arrives at the same plan by a
-            // different route. What is measured is whether the shape is
-            // recognised when it appears, not how often it appears.
-            loop_tried += 1;
-            let _ = client.batch_execute("SET enable_hashjoin = off; SET enable_mergejoin = off;");
-            let looped = plan_of(&mut client, &join);
-            if looped.is_err() {
-                joins_could_not_run += 1;
-            }
-            if let Ok(plan) = looped {
-                let after = Shape::of(&plan);
-                // The worst inner scan in the plan, against the same row floor
-                // the rule uses. Counting a bite the rule is *right* to ignore
-                // would make this harness fail the build for pgplan being
-                // correct on a small table — which is the exact failure this
-                // whole project is built to avoid, arriving from inside its own
-                // evidence. Borrowed from the crate rather than restated, so
-                // the two cannot drift apart.
-                let worst = after
-                    .inner_loop_rows
-                    .values()
-                    .copied()
-                    .fold(0.0_f64, f64::max);
-                if worst < SEQ_SCAN_ROWS {
-                    // Either the planner found something better even with two
-                    // join methods gone, or the inner side is small enough that
-                    // scanning it is the right answer. Nothing to detect.
-                } else {
-                    loop_bit += 1;
-                    if pair.indexed {
-                        loop_bit_indexed += 1;
-                    }
-                    if compare(&before, &after)
-                        .iter()
-                        .any(|r| matches!(r, Regression::NestedLoopOverSequentialScan { .. }))
-                    {
-                        loop_named += 1;
-                    }
-                }
-            }
-            let _ = client.batch_execute("RESET enable_hashjoin; RESET enable_mergejoin;");
-
-            // Experiment six: the same join with work_mem at the floor, which
-            // is what a busy machine and a grown table look like together.
-            spill_tried += 1;
-            let _ = client.batch_execute("SET work_mem = '64kB'");
-            let cramped = plan_of(&mut client, &join);
-            if cramped.is_err() {
-                joins_could_not_run += 1;
-            }
-            if let Ok(plan) = cramped {
-                let after = Shape::of(&plan);
-                // Mirrors the rule, including its guard that the baseline
-                // actually had a hash join to fit in memory. A bite measure
-                // that outlives the rule it measures is not a bite measure.
-                if before.nodes.contains("Hash Join")
-                    && before.max_batches <= 1
-                    && after.max_batches > 1
-                {
-                    spill_bit += 1;
-                    if compare(&before, &after)
-                        .iter()
-                        .any(|r| matches!(r, Regression::HashJoinSpilled { .. }))
-                    {
-                        spill_named += 1;
-                    }
-                }
-            }
-            let _ = client.batch_execute("RESET work_mem");
-        }
-        let _ = client.batch_execute("RESET statement_timeout");
 
         // Experiment seven, baselined here and judged after the drop below: a
         // count through the index. One row comes back whichever way it is
@@ -812,17 +920,6 @@ fn against_schemas_nobody_here_designed() {
         total.sort_named += sort_named;
         total.wrapped_tried += wrapped_tried;
         total.wrapped_named += wrapped_named;
-        total.pairs += pairs.len();
-        total.pairs_unplanned += pairs_unplanned;
-        total.joins_could_not_run += joins_could_not_run;
-        total.pairs_unindexed += pairs.iter().filter(|pair| !pair.indexed).count();
-        total.loop_tried += loop_tried;
-        total.loop_bit += loop_bit;
-        total.loop_named += loop_named;
-        total.loop_bit_indexed += loop_bit_indexed;
-        total.spill_tried += spill_tried;
-        total.spill_bit += spill_bit;
-        total.spill_named += spill_named;
         total.ratio_tried += ratio_tried;
         total.ratio_scanned += ratio_scanned;
         total.ratio_named += ratio_named;
@@ -835,9 +932,8 @@ fn against_schemas_nobody_here_designed() {
         total.flapped += flapped;
         total.benign += benign;
         let line = format!(
-            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · swapped {dropped_swapped:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2} · fk {:>1} loop {loop_named}/{loop_bit} spill {spill_named}/{spill_bit} ratio {ratio_named}/{ratio_scanned}",
-            baselined.len(),
-            pairs.len()
+            "  {name:<24} ddl {ddl:>3}s · seed {seed:>3}s · {:>2} q · scan {named_scan:>2} · index-only {named_index:>2} · swapped {dropped_swapped:>2} · missed {missed:>2} · undroppable {undropped:>2} · flap {flapped:>2} · benign {benign:>2} · {joins} ratio {ratio_named}/{ratio_scanned}",
+            baselined.len()
         );
         println!("{line}");
         per_schema.push(line);
@@ -850,8 +946,8 @@ fn against_schemas_nobody_here_designed() {
     }
     let dropped = total.named_the_scan + total.named_only_the_index + total.missed;
     println!(
-        "\n  {} schemas produced a query. {} candidate lookups had rows behind them, and {} of those were planned through the index — only those are counted below.",
-        total.schemas, total.candidates, total.queries
+        "\n  {} schemas produced a query and {} produced a join. {} candidate lookups had rows behind them, and {} of those were planned through the index — only those are counted below.",
+        total.schemas, total.schemas_joined, total.candidates, total.queries
     );
     println!("\n  index dropped, of {dropped}:");
     println!(
@@ -991,8 +1087,49 @@ fn against_schemas_nobody_here_designed() {
 fn the_statement_splitter_handles_what_a_dump_contains() {
     assert_eq!(statements("SELECT 1; SELECT 2;").len(), 2);
     assert_eq!(statements("SELECT ';';").len(), 1);
+    // A function body opened and closed on one line. Toggling once per line
+    // left the parser inside a body forever and swallowed the rest of the file.
+    let one_line = "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$;\n\
+                    CREATE TABLE t (id int);\n\
+                    CREATE TABLE u (id int);";
+    let split = statements(one_line);
+    assert_eq!(
+        split.iter().filter(|s| shapes_the_schema(s)).count(),
+        2,
+        "both tables should survive a one-line function body: {split:?}"
+    );
+    // And a body genuinely spanning lines still holds together.
+    let spanning = "CREATE FUNCTION g() RETURNS trigger AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$;\n\
+                    CREATE TABLE v (id int);";
+    assert_eq!(
+        statements(spanning)
+            .iter()
+            .filter(|s| shapes_the_schema(s))
+            .count(),
+        1
+    );
     assert!(shapes_the_schema("CREATE TABLE t (id int);"));
     assert!(shapes_the_schema("-- a note\nCREATE INDEX i ON t (id);"));
     assert!(!shapes_the_schema("INSERT INTO t VALUES (1);"));
     assert!(!shapes_the_schema("GRANT ALL ON t TO admin;"));
+}
+
+#[test]
+fn the_schemas_a_dump_writes_into_are_found() {
+    let found = schemas_written_to(&[
+        "CREATE TABLE hdb_catalog.hdb_version (id int);".to_string(),
+        "CREATE TABLE IF NOT EXISTS zitadel.instances(id text);".to_string(),
+        "CREATE TABLE public.plain (id int);".to_string(),
+        "CREATE TABLE unqualified (id int);".to_string(),
+        r#"CREATE TABLE "Mixed Case"."t" (id int);"#.to_string(),
+    ]);
+    assert!(found.contains("hdb_catalog"));
+    assert!(found.contains("zitadel"));
+    assert!(found.contains("Mixed Case"));
+    assert!(!found.contains("public"), "public always exists");
+    assert_eq!(
+        found.len(),
+        3,
+        "unqualified names name no schema: {found:?}"
+    );
 }

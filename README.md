@@ -170,7 +170,7 @@ Mattermost, Synapse and others — seeded by [pgseed][pgseed] at volume and
 queried on indexes those projects chose for themselves. All six named
 regressions are exercised there, three of them only since the joins were added.
 
-Of 76 queries the planner routed through an index, then degraded four ways.
+Of 81 queries the planner routed through an index, then degraded four ways.
 Dropping an index does not always make a plan worse — nine times the planner
 reached the same data through another index without reading more, and those are
 held out rather than counted as failures to detect:
@@ -178,23 +178,24 @@ held out rather than counted as failures to detect:
 | | | |
 |---|---:|---:|
 | the index dropped, the plan absorbed it | 9 | *nothing to report* |
-| of the 67 that degraded, a sequential scan named | **67** | (100%) |
-| of the 67 that degraded, nothing said | **0** | |
-| the column wrapped so the index cannot serve it | **76** | (100%) |
-| an `ORDER BY` the index supplied, a sort named | **68 of 75** | (91%) |
-| a `count(*)` whose index went, of the 67 that fell back to a scan | **67** | (100%) |
+| of the 72 that degraded, a sequential scan named | **72** | (100%) |
+| of the 72 that degraded, nothing said | **0** | |
+| the column wrapped so the index cannot serve it | **81** | (100%) |
+| an `ORDER BY` the index supplied, a sort named | **73 of 80** | (91%) |
+| a `count(*)` whose index went, of the 72 that fell back to a scan | **72** | (100%) |
 
-And across 29 foreign-key pairs with rows on both sides, joined:
+And across 41 foreign-key pairs with rows on both sides, joined:
 
 | | | |
 |---|---:|---:|
-| forced onto a nested loop, of the 12 that put a scan on the inner side | **12** | (100%) |
-| `work_mem` at its floor, of the 29 that actually spilled | **29** | (100%) |
+| forced onto a nested loop, of the 22 that put a scan on the inner side | **22** | (100%) |
+| `work_mem` at its floor, of the 39 that actually spilled | **39** | (100%) |
 
-The spill row's denominator is the one thing here that moves: across five runs
-on identical data it bit 27, 29, 27, 27 and 29 times of 29, because `ANALYZE`
-samples and the planner's batch decision moves with the statistics. Every bite
-was named in every run, and no other figure above changed in any of them.
+The spill row's denominator is the one thing here that moves: across six runs it
+bit 27, 29, 27, 27, 29 and 39, the last after the survey was widened, and the
+run-to-run movement is always the same two GitLab pairs. `ANALYZE` samples, so
+the planner's batch decision moves with the statistics. Every bite was named in
+every run.
 
 And with nothing made worse — re-`ANALYZE`d, a column added, an unrelated index
 added, each an ordinary migration:
@@ -215,12 +216,13 @@ those as misses is a mistake this survey made three times before it stopped
 making it, so each experiment reports *tried*, *bit* and *named* separately and
 only the bites are a denominator.
 
-Seven of the twenty-four schemas produced no measurement, because they offer no
-non-unique single-column index on a scalar type — and since seeding follows that
-search, their joins are not reached either. They are counted as
-could-not-measure rather than quietly dropped. The method, the full per-schema
-table, what the numbers do *not* show, five ways the survey gave a wrong answer
-before it gave a right one, and the two bugs it found in this tool's own
+Eighteen of the twenty-four schemas produce a lookup query and twenty-one produce
+a join; three produce neither, for three different reasons, and all three are
+named. Three of the seven that once produced nothing turned out to be schemas the
+harness had failed to load and then measured as empty — the seventh of seven ways
+this survey has been wrong, and the reason it now reports what it could not do
+beside what it did. The method, the full per-schema table, what the numbers do
+*not* show, all seven wrong answers, and the two bugs it found in this tool's own
 nested-loop rule are in
 [docs/corpus-validation.md](docs/corpus-validation.md).
 
