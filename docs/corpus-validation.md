@@ -149,6 +149,7 @@ joins, from 29 foreign-key pairs with rows on both sides
                                       inner side; all 12 were named
   work_mem at the floor ............. 27 of 29 actually spilled;
                                       all 27 were named
+  could not be run at all ...........  0
 
 reported when nothing got worse
   nothing changed at all ............  0
@@ -208,6 +209,16 @@ because the planner did not route them through the index even with it present.
 A query already being scanned sequentially cannot regress that way, and counting
 it would have flattered the result.
 
+**The spill experiment's denominator is not stable between runs.** Across three
+runs of identical code against identical seeded data it bit 27, then 29, then 27
+times out of 29. It is not errors or timeouts — the survey counts those
+separately and reported zero. The likely cause is that `ANALYZE` samples rather
+than reads every row, so column statistics differ a little between runs and the
+planner's hash-batch decision moves with them; that is stated as the likely
+cause rather than a demonstrated one. What did not move: pgplan named **every**
+bite in all three runs, and every other figure on this page was identical in all
+three. The denominator wobbles; the detection rate does not.
+
 **Two schemas offered no foreign-key pair at all** with rows on both sides:
 harbor and mattermost. Mattermost declares almost no foreign keys, which is a
 fact about Mattermost rather than about this tool, and it is why the join
@@ -229,11 +240,11 @@ choice, and a column filled with deterministic synthetic values does not have
 production's distribution. This measures the pair — pgseed's data and pgplan's
 judgement — on real *schemas*, not on real *data*.
 
-## Five ways this survey was wrong before it was right
+## Six ways this survey was wrong before it was right
 
 Each produced a plausible number that was wrong in a different direction, which
-is the argument for not publishing the first result a harness gives you. Four of
-the five share one shape: **an experiment that did not bite is indistinguishable
+is the argument for not publishing the first result a harness gives you. Five of
+the six share one shape: **an experiment that did not bite is indistinguishable
 from a tool that missed something**, unless you check.
 
 1. **It never finished.** The first version seeded 2,000 rows into all 1,057
@@ -268,10 +279,21 @@ from a tool that missed something**, unless you check.
    right about a small table, which is the failure the whole project exists to
    avoid, arriving from inside its own evidence.
 
+6. **"Could not run" was filed as "did not bite".** The join experiments read
+   `if let Ok(plan) = plan_of(...)`, so a statement timeout and a planner that
+   simply chose a different shape landed in the same bucket — in the code
+   written to fix number 5, by the person who had just written number 5. It
+   surfaced only because a figure moved between two runs with nothing to
+   explain it, and the harness could not say which of the two had happened.
+   Errors and timeouts are now counted and reported on their own line. They
+   turned out to be zero, which means the wobble is the planner's and is
+   described above; but that was worth knowing rather than assuming.
+
 The harness now excludes constraint-backed indexes, verifies that each drop
 actually happened, uses a wrap that bites on every candidate type, reports a
-bite measure for each of the three experiments that can decline to bite, and
-prints every denominator so that none of them is implied.
+bite measure for each of the three experiments that can decline to bite,
+separates "could not be run" from "did not bite", and prints every denominator
+so that none of them is implied.
 
 ## What this survey found in pgplan
 
@@ -304,6 +326,44 @@ The baseline file is version 2 as a result. A version-1 file still parses — th
 new field defaults — and that is exactly the hazard, because it would then
 compare cleanly while answering a different question. It is refused with an
 instruction instead.
+
+**Two more of the same species, found by probing rather than by reading.** The
+review that caught the nested-loop rule had examined all six and pronounced four
+of them sound. Those four were only *read*. Probed with constructed plans
+afterwards, all four turned out to claim something they did not check, and two
+were worth fixing immediately:
+
+- **`MoreRowsPerRowReturned` said "for the same answer" without looking at the
+  answer.** The ratio is rows read over rows returned, so it doubles just as
+  readily when the denominator falls — and the denominator falls whenever the
+  data shifts under a predicate, with the plan untouched and not one extra row
+  read. The comparability fingerprint does not save you: it buckets table volume
+  by order of magnitude, and a table can hold ten thousand rows while what
+  matches a `WHERE` moves from a hundred to ten. It now also requires the total
+  actually read to have doubled.
+- **`HashJoinSpilled` said the baseline "fitted in memory" without checking
+  there was a hash join in it.** `max_batches` starts at one and is only raised
+  by a node reporting batches, so "one batch" and "no hash join anywhere" are
+  the same number. A plan that *gained* a spilling hash join where the baseline
+  had a nested loop was reported as one that had fitted in memory. It now
+  requires a hash join in the baseline.
+
+Neither cost a single true positive: every figure in the result above is
+identical before and after. That is what a fix to an over-claim should look
+like — it removes findings that were never earned and leaves the rest alone.
+
+Fixing the second also corrected a fixture that had been quietly wrong. The unit
+test wrote `Hash Batches` on the `Hash Join` node; a real planner puts it on the
+`Hash` node below. The test passed anyway, which is a fixture agreeing with its
+author inside the file arguing against exactly that.
+
+The two remaining probes are recorded and not yet fixed, because both need the
+shape to carry more than it does. `IndexNoLongerUsed` cannot tell an index being
+*swapped for a better one* from an index being lost, which breaks the promise
+that a better plan never fails a build; telling them apart needs the shape to
+know which table each index belonged to. And `SequentialScanAppeared` sums rows
+across loops, so a forty-row table scanned forty times crosses a threshold whose
+stated purpose is "the table is big enough for this to matter".
 
 ## What this survey found in pgseed
 

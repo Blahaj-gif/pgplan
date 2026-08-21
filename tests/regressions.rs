@@ -96,7 +96,7 @@ fn a_hash_join_pushed_into_spilling_is_caught() {
     let after = shape(&mut cramped, join);
 
     let found = compare(&before, &after);
-    if before.max_batches <= 1 && after.max_batches > 1 {
+    if before.nodes.contains("Hash Join") && before.max_batches <= 1 && after.max_batches > 1 {
         assert!(
             found
                 .iter()

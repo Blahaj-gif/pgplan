@@ -61,7 +61,9 @@ impl Regression {
             ),
             Regression::MoreRowsPerRowReturned { before, after } => format!(
                 "this reads {after:.0} rows for every row it returns, against {before:.0} in \
-                 the baseline. The query is doing more work for the same answer."
+                 the baseline, and the total it reads has at least doubled as well. So this \
+                 is more work being done, rather than a smaller result set flattering the \
+                 ratio."
             ),
             Regression::SortAppeared { keys } => format!(
                 "a sort on ({}) appeared where the baseline had none, so this query is now \
@@ -131,9 +133,22 @@ pub fn compare(before: &Shape, after: &Shape) -> Vec<Regression> {
 
     // Work per unit of answer. Skipped entirely when either side returned
     // nothing, because a ratio over zero rows says nothing about the query.
+    //
+    // The ratio alone is not enough, and this was wrong before it was right.
+    // It is rows read over rows returned, so it doubles just as readily when
+    // the *denominator* falls — and the denominator falls whenever the data
+    // shifts under a predicate, with the plan untouched and not one extra row
+    // read. The comparability fingerprint does not catch that, because it
+    // buckets table volume by order of magnitude and a table can hold ten
+    // thousand rows while what matches a `WHERE` moves from a hundred to ten.
+    //
+    // So the numerator has to have moved too. Requiring the total actually
+    // read to have doubled makes the finding say only what both numbers show:
+    // more work, not a smaller result set.
     if let (Some(before_ratio), Some(after_ratio)) = (before.amplification(), after.amplification())
     {
-        if before_ratio > 0.0 && after_ratio >= before_ratio * AMPLIFICATION_FACTOR {
+        let reads_more = after.rows_scanned >= before.rows_scanned * AMPLIFICATION_FACTOR;
+        if before_ratio > 0.0 && after_ratio >= before_ratio * AMPLIFICATION_FACTOR && reads_more {
             found.push(Regression::MoreRowsPerRowReturned {
                 before: before_ratio,
                 after: after_ratio,
@@ -159,7 +174,15 @@ pub fn compare(before: &Shape, after: &Shape) -> Vec<Regression> {
         found.push(Regression::SortAppeared { keys: new_sorts });
     }
 
-    if after.max_batches > 1 && before.max_batches <= 1 {
+    // A hash join that has started spilling. `max_batches` begins at one and is
+    // only raised by a node that reports batches, so "one batch" and "no hash
+    // join anywhere" are the same number — and without the guard below, a plan
+    // that *gained* a spilling hash join where the baseline had a nested loop
+    // was reported as one that "fitted in memory in the baseline". It had not
+    // fitted in memory; it had not existed. Verified against a real planner:
+    // `Hash Batches` sits on the `Hash` node rather than on the `Hash Join`
+    // above it, and both are present whenever either is.
+    if before.nodes.contains("Hash Join") && before.max_batches <= 1 && after.max_batches > 1 {
         found.push(Regression::HashJoinSpilled {
             batches: after.max_batches,
         });
@@ -364,13 +387,100 @@ mod tests {
         );
     }
 
+    /// Shaped the way a real planner shapes it, which is not where anyone
+    /// writing this from memory puts it: `Hash Batches` is reported on the
+    /// `Hash` node, not on the `Hash Join` above it. The previous fixture put
+    /// it on the join, which is a fixture agreeing with its author.
+    fn hash_join(batches: i64) -> Shape {
+        shape(&format!(
+            r#"{{"Node Type": "Hash Join", "Actual Rows": 10.0, "Actual Loops": 1.0,
+                  "Plans": [
+                   {{"Node Type": "Seq Scan", "Relation Name": "a",
+                     "Parent Relationship": "Outer",
+                     "Actual Rows": 10.0, "Actual Loops": 1.0}},
+                   {{"Node Type": "Hash", "Parent Relationship": "Inner",
+                     "Hash Batches": {batches},
+                     "Actual Rows": 10.0, "Actual Loops": 1.0, "Plans": [
+                      {{"Node Type": "Seq Scan", "Relation Name": "b",
+                        "Parent Relationship": "Outer",
+                        "Actual Rows": 10.0, "Actual Loops": 1.0}}]}}]}}"#
+        ))
+    }
+
     #[test]
     fn a_hash_join_that_starts_spilling_is_a_regression() {
-        let before = shape(r#"{"Node Type": "Hash Join", "Hash Batches": 1}"#);
-        let after = shape(r#"{"Node Type": "Hash Join", "Hash Batches": 16}"#);
         assert_eq!(
-            compare(&before, &after),
+            compare(&hash_join(1), &hash_join(16)),
             vec![Regression::HashJoinSpilled { batches: 16 }]
+        );
+    }
+
+    /// A plan that *gained* a hash join did not have one that fitted in memory.
+    ///
+    /// `max_batches` cannot tell "one batch" from "no hash join", so without a
+    /// guard this reported a spill against a baseline that never hashed
+    /// anything — naming a cause that had not happened, which is the same
+    /// over-claim the nested-loop rule was carrying.
+    #[test]
+    fn a_plan_that_gained_a_hash_join_is_not_a_spill() {
+        let looped = shape(
+            r#"{"Node Type": "Nested Loop", "Actual Rows": 10.0, "Actual Loops": 1.0,
+                 "Plans": [
+                  {"Node Type": "Index Scan", "Relation Name": "a", "Index Name": "a_pkey",
+                   "Parent Relationship": "Outer", "Actual Rows": 10.0, "Actual Loops": 1.0},
+                  {"Node Type": "Index Scan", "Relation Name": "b", "Index Name": "b_pkey",
+                   "Parent Relationship": "Inner", "Actual Rows": 1.0, "Actual Loops": 10.0}]}"#,
+        );
+        let found = compare(&looped, &hash_join(8));
+        assert!(
+            !found
+                .iter()
+                .any(|r| matches!(r, Regression::HashJoinSpilled { .. })),
+            "there was no hash join in the baseline to fit in memory: {found:?}"
+        );
+    }
+
+    /// The ratio doubled and the query did not read one extra row.
+    ///
+    /// Identical plan, identical rows scanned; only what matched the predicate
+    /// moved. That is the data changing, not the query getting worse, and the
+    /// fingerprint will not stop it — it buckets table volume by order of
+    /// magnitude, and this table did not change size.
+    #[test]
+    fn a_ratio_that_moved_because_fewer_rows_matched_is_not_a_regression() {
+        let plan = |returned: f64| {
+            shape(&format!(
+                r#"{{"Node Type": "Seq Scan", "Relation Name": "t",
+                      "Actual Rows": {returned}, "Rows Removed by Filter": {},
+                      "Actual Loops": 1.0}}"#,
+                10_000.0 - returned
+            ))
+        };
+        let found = compare(&plan(100.0), &plan(10.0));
+        assert!(
+            found.is_empty(),
+            "ten thousand rows read on both sides is not more work: {found:?}"
+        );
+    }
+
+    /// And the case it must still catch: the answer held and the work went up.
+    #[test]
+    fn a_ratio_that_moved_because_the_work_went_up_is_still_a_regression() {
+        let before = shape(
+            r#"{"Node Type": "Seq Scan", "Relation Name": "t",
+                 "Actual Rows": 100.0, "Rows Removed by Filter": 900.0,
+                 "Actual Loops": 1.0}"#,
+        );
+        let after = shape(
+            r#"{"Node Type": "Seq Scan", "Relation Name": "t",
+                 "Actual Rows": 100.0, "Rows Removed by Filter": 99900.0,
+                 "Actual Loops": 1.0}"#,
+        );
+        assert!(
+            compare(&before, &after)
+                .iter()
+                .any(|r| matches!(r, Regression::MoreRowsPerRowReturned { .. })),
+            "same hundred rows back, a hundred times the reading"
         );
     }
 

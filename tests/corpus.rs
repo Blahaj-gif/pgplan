@@ -300,6 +300,16 @@ struct Tally {
     /// Foreign-key pairs found with rows on both sides — the denominator for
     /// the three join experiments below.
     pairs: usize,
+    /// Pairs whose join would not plan at all, and experiments that errored or
+    /// ran past the statement timeout.
+    ///
+    /// Kept apart from "did not bite" because they are not the same thing and
+    /// were being counted as though they were. A planner declining to produce a
+    /// shape is a fact about the planner; a query that never finished is a fact
+    /// about this machine, and reading the second as the first is how a number
+    /// moves between two runs of identical code with nothing to explain it.
+    pairs_unplanned: usize,
+    joins_could_not_run: usize,
     /// Of those, the ones whose referencing column nobody indexed. Reported
     /// because the claim that this shape is common rests on it.
     pairs_unindexed: usize,
@@ -589,6 +599,7 @@ fn against_schemas_nobody_here_designed() {
         // than a curiosity.
         let pairs = related(&mut client, 2);
         let (mut loop_tried, mut loop_bit, mut loop_named) = (0, 0, 0);
+        let (mut pairs_unplanned, mut joins_could_not_run) = (0, 0);
         let mut loop_bit_indexed = 0;
         let (mut spill_tried, mut spill_bit, mut spill_named) = (0, 0, 0);
         // A join that goes quadratic can take a long time to *run*, and
@@ -608,6 +619,7 @@ fn against_schemas_nobody_here_designed() {
                 quote(&pair.referenced)
             );
             let Ok(plan) = plan_of(&mut client, &join) else {
+                pairs_unplanned += 1;
                 continue;
             };
             let before = Shape::of(&plan);
@@ -620,7 +632,11 @@ fn against_schemas_nobody_here_designed() {
             // recognised when it appears, not how often it appears.
             loop_tried += 1;
             let _ = client.batch_execute("SET enable_hashjoin = off; SET enable_mergejoin = off;");
-            if let Ok(plan) = plan_of(&mut client, &join) {
+            let looped = plan_of(&mut client, &join);
+            if looped.is_err() {
+                joins_could_not_run += 1;
+            }
+            if let Ok(plan) = looped {
                 let after = Shape::of(&plan);
                 // The worst inner scan in the plan, against the same row floor
                 // the rule uses. Counting a bite the rule is *right* to ignore
@@ -657,9 +673,19 @@ fn against_schemas_nobody_here_designed() {
             // is what a busy machine and a grown table look like together.
             spill_tried += 1;
             let _ = client.batch_execute("SET work_mem = '64kB'");
-            if let Ok(plan) = plan_of(&mut client, &join) {
+            let cramped = plan_of(&mut client, &join);
+            if cramped.is_err() {
+                joins_could_not_run += 1;
+            }
+            if let Ok(plan) = cramped {
                 let after = Shape::of(&plan);
-                if before.max_batches <= 1 && after.max_batches > 1 {
+                // Mirrors the rule, including its guard that the baseline
+                // actually had a hash join to fit in memory. A bite measure
+                // that outlives the rule it measures is not a bite measure.
+                if before.nodes.contains("Hash Join")
+                    && before.max_batches <= 1
+                    && after.max_batches > 1
+                {
                     spill_bit += 1;
                     if compare(&before, &after)
                         .iter()
@@ -773,6 +799,8 @@ fn against_schemas_nobody_here_designed() {
         total.wrapped_tried += wrapped_tried;
         total.wrapped_named += wrapped_named;
         total.pairs += pairs.len();
+        total.pairs_unplanned += pairs_unplanned;
+        total.joins_could_not_run += joins_could_not_run;
         total.pairs_unindexed += pairs.iter().filter(|pair| !pair.indexed).count();
         total.loop_tried += loop_tried;
         total.loop_bit += loop_bit;
@@ -855,6 +883,12 @@ fn against_schemas_nobody_here_designed() {
         "    work_mem at the floor ............. {} tried, {} actually spilled, {} named",
         total.spill_tried, total.spill_bit, total.spill_named
     );
+    if total.pairs_unplanned > 0 || total.joins_could_not_run > 0 {
+        println!(
+            "    could not be run at all ........... {} pairs whose join would not plan, {} experiments that errored or timed out",
+            total.pairs_unplanned, total.joins_could_not_run
+        );
+    }
     println!(
         "\n  a count through an index that was then dropped, of {} tried:",
         total.ratio_tried
