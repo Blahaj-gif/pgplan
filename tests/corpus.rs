@@ -1083,6 +1083,327 @@ fn against_schemas_nobody_here_designed() {
     );
 }
 
+/// How long one schema's seeding may take in the upgrade experiment.
+///
+/// Lower than the survey's, because this seeds the same schema once per server
+/// and there are three of them. GitLab needs seven minutes on its own and is
+/// reported as skipped rather than allowed to dominate the run.
+const UPGRADE_SEED_BUDGET: u64 = 150;
+
+/// Does a query plan the same way after a major Postgres upgrade?
+///
+/// Every vendor runbook for a major upgrade describes the same manual ritual:
+/// capture the important queries, replay them on the new cluster, compare the
+/// plans, and — the hard part — tell a real regression from a plan that merely
+/// changed. That last clause is what this project is for, so the question is
+/// whether it already answers it.
+///
+/// **The control arm is the whole experiment.** A count of findings between two
+/// server versions means nothing on its own, because two fresh clusters of the
+/// *same* version do not necessarily agree either: `ANALYZE` samples rather than
+/// reading every row, and this survey has already watched a spill verdict move
+/// between runs for that reason. So every schema is measured three times — twice
+/// on 16.4 and once on 17.0 — and the same-version pair is the noise floor that
+/// the cross-version pair has to be read against.
+///
+/// A schema whose *fingerprint* differs between two servers is dropped rather
+/// than compared. The DDL is tolerant of statement failures by design, so a
+/// statement that succeeds on one version and fails on another would leave two
+/// different databases, and comparing plans across those measures the loader
+/// rather than the planner.
+///
+/// **What it does not establish.** The queries are single-column indexed
+/// lookups, which are the easiest plans Postgres makes, and the control arm
+/// finding *zero* difference cuts both ways: either the method is clean, or the
+/// instrument is not sensitive. The survey's join experiments do move between
+/// identical runs and these do not, which points at the second. The upgrade
+/// risks people actually fear are joins, aggregates and partitioned tables, and
+/// this says nothing about them.
+///
+/// It also compares the shape pgplan gates on, not the whole plan. Costs,
+/// widths and parallel worker counts are discarded by design, so two plans that
+/// differ only there are identical here — correctly, for this tool's purpose,
+/// but it is a narrower claim than "the plans are the same".
+///
+/// `cargo test --test corpus plans_across_a_major_upgrade -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn plans_across_a_major_upgrade() {
+    let corpus = pgseed_dir().join("tests/corpus");
+    let seeder = pgseed_dir().join("target/release/pgseed.exe");
+    if !corpus.exists() {
+        eprintln!("corpus not fetched at {corpus:?}; skipping");
+        return;
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&corpus)
+        .expect("corpus directory")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    files.sort();
+
+    #[derive(Default)]
+    struct Arm {
+        compared: usize,
+        /// Shapes that came back byte-identical. The strong outcome: the
+        /// planner did the same thing, not merely something forgivable.
+        identical: usize,
+        /// Shapes that differ but that no rule is willing to call worse. These
+        /// are the interesting ones, and folding them into "no findings" would
+        /// overstate what was shown.
+        changed_benign: usize,
+        findings: Vec<String>,
+    }
+    let mut control = Arm::default();
+    let mut upgrade = Arm::default();
+    let mut drifted: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut versions: BTreeSet<String> = BTreeSet::new();
+    // Evidence the questions are worth asking: a query the planner answers with
+    // a bare sequential scan on both servers compares equal for a reason that
+    // has nothing to do with either planner.
+    let mut through_an_index = 0usize;
+
+    println!("\nplan stability across a major version\n");
+
+    for file in &files {
+        let name = file.file_stem().unwrap().to_string_lossy().to_string();
+        let Ok(sql) = std::fs::read_to_string(file) else {
+            continue;
+        };
+
+        // The first server decides the questions. The other two answer the
+        // same ones, verbatim, or the comparison is between two different
+        // experiments rather than two planners.
+        let Some(first) = measured(&sql, "=16.4.0", &seeder, None) else {
+            skipped.push(format!("{name} (16.4 a)"));
+            continue;
+        };
+        if first.queries.is_empty() {
+            skipped.push(format!("{name} (no query)"));
+            continue;
+        }
+        let asked = Some(first.queries.clone());
+        let Some(again) = measured(&sql, "=16.4.0", &seeder, asked.clone()) else {
+            skipped.push(format!("{name} (16.4 b)"));
+            continue;
+        };
+        let Some(newer) = measured(&sql, "=17.0.0", &seeder, asked) else {
+            skipped.push(format!("{name} (17.0)"));
+            continue;
+        };
+
+        // Same database, or the plans are not comparable and nothing below is
+        // about the planner.
+        let mut fine = true;
+        for (label, other) in [("16.4 b", &again), ("17.0", &newer)] {
+            let drift = other.fingerprint.drift_from(&first.fingerprint);
+            if !drift.is_empty() {
+                drifted.push(format!("{name} vs {label}: {}", drift.len()));
+                fine = false;
+            }
+        }
+        if !fine {
+            continue;
+        }
+
+        versions.insert(first.version.clone());
+        versions.insert(again.version.clone());
+        versions.insert(newer.version.clone());
+        through_an_index += first
+            .shapes
+            .iter()
+            .filter(|shape| !shape.indexes.is_empty())
+            .count();
+
+        let counted = |arm: &mut Arm, other: &Measured| {
+            for (index, before) in first.shapes.iter().enumerate() {
+                let Some(after) = other.shapes.get(index) else {
+                    continue;
+                };
+                arm.compared += 1;
+                let found = compare(before, after);
+                if !found.is_empty() {
+                    for finding in found {
+                        arm.findings.push(format!("{name}: {}", finding.explain()));
+                    }
+                } else if before == after {
+                    arm.identical += 1;
+                } else {
+                    arm.changed_benign += 1;
+                }
+            }
+        };
+        counted(&mut control, &again);
+        counted(&mut upgrade, &newer);
+
+        println!(
+            "  {name:<24} {:>2} queries · {} / {} / {} · control same {:>2} · upgraded same {:>2}",
+            first.queries.len(),
+            first.version,
+            again.version,
+            newer.version,
+            control.identical,
+            upgrade.identical
+        );
+    }
+
+    let report = |label: &str, arm: &Arm| {
+        println!("\n  {label}");
+        println!("    {} queries compared", arm.compared);
+        println!("    identical plan shape ......... {}", arm.identical);
+        println!("    changed, nothing called worse  {}", arm.changed_benign);
+        println!("    regressions .................. {}", arm.findings.len());
+        for line in arm.findings.iter().take(8) {
+            println!("      {line}");
+        }
+    };
+    println!(
+        "\n  server versions actually measured: {}",
+        versions.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    println!(
+        "  of {} baseline plans, {} reach their data through an index",
+        control.compared, through_an_index
+    );
+    report(
+        "same version, two fresh clusters (the noise floor)",
+        &control,
+    );
+    report("16.4 -> 17.0", &upgrade);
+
+    if !drifted.is_empty() {
+        println!(
+            "\n  dropped, the two databases were not the same: {}",
+            drifted.join(", ")
+        );
+    }
+    if !skipped.is_empty() {
+        println!("\n  not measured: {}", skipped.join(", "));
+    }
+
+    // The guards. Each one is a way this could report a comfortable zero while
+    // having compared nothing worth comparing.
+    assert!(
+        versions.iter().any(|v| v.starts_with("16."))
+            && versions.iter().any(|v| v.starts_with("17.")),
+        "both major versions have to have actually run, and the servers \
+         reported: {versions:?}"
+    );
+    assert!(
+        control.compared >= 50,
+        "only {} queries were compared, which is too few to conclude anything",
+        control.compared
+    );
+    assert!(
+        through_an_index * 2 >= control.compared,
+        "only {through_an_index} of {} baseline plans use an index at all; \
+         comparing bare sequential scans across two planners shows nothing",
+        control.compared
+    );
+}
+
+struct Measured {
+    /// What the server said it was, not what it was asked to be. Without this
+    /// the experiment can compare 16.4 against 16.4 twice and report zero
+    /// differences, which is the answer it was hoping for and no evidence at
+    /// all. A test that can pass while measuring nothing is the failure this
+    /// whole file keeps finding elsewhere.
+    version: String,
+    fingerprint: pgplan::fingerprint::Fingerprint,
+    queries: Vec<String>,
+    shapes: Vec<Shape>,
+}
+
+/// One schema, on one server, answering either its own questions or somebody
+/// else's.
+fn measured(
+    sql: &str,
+    version: &str,
+    seeder: &std::path::Path,
+    asked: Option<Vec<String>>,
+) -> Option<Measured> {
+    let db = Db::at_version(version);
+    let mut client = db.client();
+
+    let shaping: Vec<String> = statements(sql)
+        .into_iter()
+        .filter(|s| shapes_the_schema(s))
+        .collect();
+    for schema in schemas_written_to(&shaping) {
+        let _ = client.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote(&schema)));
+    }
+    for statement in &shaping {
+        let _ = client.batch_execute(statement);
+    }
+    let _ = client.batch_execute("SET search_path TO public;");
+
+    let wanted = lookups(&mut client, 6, false);
+    if wanted.is_empty() {
+        return None;
+    }
+    if seeder.exists() {
+        let mut args: Vec<String> = vec![
+            "--dsn".into(),
+            db.url().into(),
+            "--apply".into(),
+            "--rows".into(),
+            "3000".into(),
+            "--allow-nonempty".into(),
+            "--probe".into(),
+        ];
+        for look in &wanted {
+            args.push("--include".into());
+            args.push(look.table.clone());
+        }
+        let finished = std::process::Command::new(seeder)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()
+            .is_some_and(|child| finished_within(child, UPGRADE_SEED_BUDGET));
+        if !finished {
+            return None;
+        }
+    }
+    let _ = client.batch_execute("ANALYZE;");
+
+    let queries = match asked {
+        Some(given) => given,
+        None => {
+            let mut out = Vec::new();
+            for look in lookups(&mut client, 6, true) {
+                let Some(value) = a_value(&mut client, &look) else {
+                    continue;
+                };
+                out.push(format!(
+                    "SELECT * FROM {} WHERE {} = {value}",
+                    quote(&look.table),
+                    quote(&look.column)
+                ));
+            }
+            out
+        }
+    };
+
+    // Every question has to get an answer on every server, or the indexes stop
+    // lining up and query three is compared against query four.
+    let mut shapes = Vec::new();
+    for query in &queries {
+        let plan = plan_of(&mut client, query).ok()?;
+        shapes.push(Shape::of(&plan));
+    }
+    let fingerprint = pgplan::fingerprint::of(&mut client, &["public".to_string()]).ok()?;
+    let version: String = client.query_one("SHOW server_version", &[]).ok()?.get(0);
+    Some(Measured {
+        version,
+        fingerprint,
+        queries,
+        shapes,
+    })
+}
+
 #[test]
 fn the_statement_splitter_handles_what_a_dump_contains() {
     assert_eq!(statements("SELECT 1; SELECT 2;").len(), 2);

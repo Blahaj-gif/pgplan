@@ -25,10 +25,25 @@ pub struct Db {
 
 impl Db {
     pub fn start() -> Db {
-        let settings = Settings {
+        Db::spin(Settings {
             timeout: Some(SETUP_TIMEOUT),
             ..Settings::default()
-        };
+        })
+    }
+
+    /// A server of a named version, for asking whether an upgrade changes a
+    /// plan. Anything but the bundled version is downloaded on first use.
+    pub fn at_version(requirement: &str) -> Db {
+        use std::str::FromStr;
+        Db::spin(Settings {
+            timeout: Some(SETUP_TIMEOUT),
+            version: postgresql_embedded::VersionReq::from_str(requirement)
+                .expect("a version requirement"),
+            ..Settings::default()
+        })
+    }
+
+    fn spin(settings: Settings) -> Db {
         let mut server = PostgreSQL::new(settings);
         server.setup().expect("postgres could not be set up");
         server.start().expect("postgres could not be started");
