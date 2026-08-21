@@ -139,11 +139,23 @@ Integration tests download and start their own Postgres via
 usual: a plan is the database's opinion, so testing against a model of a planner
 would be testing a model of the thing under test.
 
-Two bugs were found that way, and neither was reachable from hand-written JSON:
-a filtered `Seq Scan` reports the rows it **kept**, with the discarded ones in a
+Four things were found that way, none reachable from hand-written JSON. A
+filtered `Seq Scan` reports the rows it **kept**, with the discarded ones in a
 separate field — so a full table scan returning ten rows looked like a ten-row
-lookup; and a bitmap plan reports its rows twice, which made *adding an index*
-register as a two-fold regression.
+lookup. A bitmap plan reports its rows twice, which made *adding an index*
+register as a two-fold regression. `Hash Batches` sits on the `Hash` node and
+not on the `Hash Join` above it, and a fixture that put it on the join passed
+anyway. And the planner will not simply do as it is told: a fixture built to
+force a loop over an unindexed table had the child put on the *outside* with a
+memoized key lookup on the inside, which is the planner being right and the test
+measuring nothing.
+
+The same rule caught a bug report that was not one. A probe showed the row
+threshold failing a build for a forty-row lookup table, because rows are summed
+across executions and repetition carried it over. Nine measured arrangements
+later: the planner materialises a small inner side rather than re-scanning it,
+so the count stays at forty. The fix that had been planned was not written. A
+finding a planner has not seen is a hypothesis.
 
 `tests/stability.rs` exists because flapping is what kills this category. It
 asserts that the same data twice gives the same answer, that a fresh `ANALYZE`
