@@ -228,6 +228,35 @@ nested-loop rule are in
 
 [pgseed]: https://github.com/Blahaj-gif/pgseed
 
+## Does a plan survive a major upgrade?
+
+Every runbook for a major Postgres upgrade says the same thing: capture the
+queries that matter, replay them on the new cluster, compare the plans, and tell
+a real regression from a plan that merely changed. Nobody appears to ship a tool
+for it — Aurora's plan management is proprietary and pins plans rather than
+checking them.
+
+So it was measured. Twenty corpus schemas, loaded and seeded on three servers —
+16.4, 16.4 again as a noise floor, and 17.0 — and 171 queries of three shapes:
+
+| | 16.4 vs 16.4 | 16.4 → 17.0 |
+|---|---:|---:|
+| indexed lookup | 93 identical | **93 identical** |
+| join, default settings | 39 identical | **39 identical** |
+| join, `work_mem` at its floor | 39 identical | **39 identical** |
+
+Not "no regressions" — no differences at all, in either arm.
+
+A zero is the answer that experiment was hoping for, so it carries a positive
+control: after each deriving server's plans are recorded, an index one of the
+queries was using is dropped and the same query replanned, and the run fails
+unless this pipeline reports that. It did, on 15 schemas. The two earlier
+versions of this experiment produced the same zero and neither was evidence —
+one never checked the servers were the versions it asked for, and the other
+established sensitivity by an argument that turned out to be wrong. The method,
+both failures, and what the result does *not* cover are in
+[docs/major-upgrades.md](docs/major-upgrades.md).
+
 ## Contributing
 
 The most useful contribution is one more named regression. The bar and the

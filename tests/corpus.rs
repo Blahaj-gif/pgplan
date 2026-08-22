@@ -25,7 +25,7 @@ mod harness;
 /// reported as unmeasured rather than allowed to stop the survey.
 const SEED_BUDGET: u64 = 600;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use harness::Db;
@@ -1142,7 +1142,7 @@ fn plans_across_a_major_upgrade() {
         .collect();
     files.sort();
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct Arm {
         compared: usize,
         /// Shapes that came back byte-identical. The strong outcome: the
@@ -1154,8 +1154,16 @@ fn plans_across_a_major_upgrade() {
         changed_benign: usize,
         findings: Vec<String>,
     }
-    let mut control = Arm::default();
-    let mut upgrade = Arm::default();
+    // One arm per (comparison, kind). Reporting a single number over all three
+    // kinds would let the insensitive one drown the sensitive one, which is the
+    // mistake this whole experiment exists to avoid making twice.
+    let mut control: BTreeMap<&str, Arm> = BTreeMap::new();
+    let mut upgrade: BTreeMap<&str, Arm> = BTreeMap::new();
+    let label = |kind: Kind| match kind {
+        Kind::Lookup => "indexed lookup",
+        Kind::Join => "join, default settings",
+        Kind::Cramped => "join, work_mem at the floor",
+    };
     let mut drifted: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut versions: BTreeSet<String> = BTreeSet::new();
@@ -1163,6 +1171,11 @@ fn plans_across_a_major_upgrade() {
     // a bare sequential scan on both servers compares equal for a reason that
     // has nothing to do with either planner.
     let mut through_an_index = 0usize;
+    // And that the join arm actually contains joins, rather than a planner that
+    // optimised them away into something else.
+    let mut with_a_join = 0usize;
+    // Schemas where the pipeline was handed a known difference and reported it.
+    let mut proved = 0usize;
 
     println!("\nplan stability across a major version\n");
 
@@ -1183,7 +1196,7 @@ fn plans_across_a_major_upgrade() {
             skipped.push(format!("{name} (no query)"));
             continue;
         }
-        let asked = Some(first.queries.clone());
+        let asked = Some((first.queries.clone(), first.filled.clone()));
         let Some(again) = measured(&sql, "=16.4.0", &seeder, asked.clone()) else {
             skipped.push(format!("{name} (16.4 b)"));
             continue;
@@ -1215,12 +1228,25 @@ fn plans_across_a_major_upgrade() {
             .iter()
             .filter(|shape| !shape.indexes.is_empty())
             .count();
+        if first.proved_it_can_see {
+            proved += 1;
+        }
+        with_a_join += first
+            .shapes
+            .iter()
+            .filter(|shape| {
+                shape.nodes.contains("Hash Join")
+                    || shape.nodes.contains("Merge Join")
+                    || shape.nodes.contains("Nested Loop")
+            })
+            .count();
 
-        let counted = |arm: &mut Arm, other: &Measured| {
+        let counted = |into: &mut BTreeMap<&str, Arm>, other: &Measured| {
             for (index, before) in first.shapes.iter().enumerate() {
                 let Some(after) = other.shapes.get(index) else {
                     continue;
                 };
+                let arm = into.entry(label(first.queries[index].0)).or_default();
                 arm.compared += 1;
                 let found = compare(before, after);
                 if !found.is_empty() {
@@ -1238,33 +1264,41 @@ fn plans_across_a_major_upgrade() {
         counted(&mut upgrade, &newer);
 
         println!(
-            "  {name:<24} {:>2} queries · {} / {} / {} · control same {:>2} · upgraded same {:>2}",
+            "  {name:<24} {:>2} queries · {} / {} / {} · same {}/{}",
             first.queries.len(),
             first.version,
             again.version,
             newer.version,
-            control.identical,
-            upgrade.identical
+            control.values().map(|a| a.identical).sum::<usize>(),
+            upgrade.values().map(|a| a.identical).sum::<usize>()
         );
     }
 
-    let report = |label: &str, arm: &Arm| {
-        println!("\n  {label}");
-        println!("    {} queries compared", arm.compared);
-        println!("    identical plan shape ......... {}", arm.identical);
-        println!("    changed, nothing called worse  {}", arm.changed_benign);
-        println!("    regressions .................. {}", arm.findings.len());
-        for line in arm.findings.iter().take(8) {
-            println!("      {line}");
+    let report = |title: &str, arms: &BTreeMap<&str, Arm>| {
+        println!("\n  {title}");
+        for (kind, arm) in arms {
+            println!(
+                "    {kind:<28} {:>3} compared, {:>3} identical, {:>2} changed, {:>2} regressions",
+                arm.compared,
+                arm.identical,
+                arm.changed_benign,
+                arm.findings.len()
+            );
+            for line in arm.findings.iter().take(4) {
+                println!("        {line}");
+            }
         }
     };
     println!(
         "\n  server versions actually measured: {}",
         versions.iter().cloned().collect::<Vec<_>>().join(", ")
     );
+    let total: usize = control.values().map(|a| a.compared).sum();
     println!(
-        "  of {} baseline plans, {} reach their data through an index",
-        control.compared, through_an_index
+        "  of {total} baseline plans, {through_an_index} reach data through an index and {with_a_join} contain a join"
+    );
+    println!(
+        "  positive control: {proved} schemas were handed a dropped index and this pipeline reported it"
     );
     report(
         "same version, two fresh clusters (the noise floor)",
@@ -1290,17 +1324,66 @@ fn plans_across_a_major_upgrade() {
         "both major versions have to have actually run, and the servers \
          reported: {versions:?}"
     );
+    let total: usize = control.values().map(|a| a.compared).sum();
     assert!(
-        control.compared >= 50,
-        "only {} queries were compared, which is too few to conclude anything",
-        control.compared
+        total >= 50,
+        "only {total} queries were compared, which is too few to conclude anything"
     );
     assert!(
-        through_an_index * 2 >= control.compared,
-        "only {through_an_index} of {} baseline plans use an index at all; \
-         comparing bare sequential scans across two planners shows nothing",
-        control.compared
+        through_an_index >= 40,
+        "only {through_an_index} baseline plans use an index at all; comparing bare sequential scans across two planners shows nothing"
     );
+    // The reason the join arm exists. Without this the experiment can report a
+    // comfortable zero for "joins" while the planner turned every one of them
+    // into something that is not a join.
+    assert!(
+        with_a_join >= 10,
+        "only {with_a_join} baseline plans contain a join node, so the join arm measured almost nothing"
+    );
+    assert!(
+        control.contains_key("join, work_mem at the floor"),
+        "the cramped-join arm never ran"
+    );
+    // The one that decides whether a zero above is a finding or a shrug. This
+    // pipeline has to have been handed a difference it did not ask for and
+    // reported it, on most of the schemas, or nothing here is evidence.
+    //
+    // Ten is a floor rather than a derived number, and saying so is better than
+    // dressing it as one: roughly seventeen schemas can host this control at
+    // all, since three contribute joins and have no lookup index to drop.
+    assert!(
+        proved >= 10,
+        "the pipeline only proved it can see a difference on {proved} schemas; a          run that reports none is not evidence unless it could have reported one"
+    );
+}
+
+/// The questions to ask and the tables to fill, decided once by the first
+/// server and handed to the others verbatim.
+type Asked = (Vec<(Kind, String)>, Vec<String>);
+
+/// What a query in the upgrade experiment is for.
+///
+/// Kept with the SQL rather than inferred from it, because the arms mean
+/// different things and a single headline over all of them would hide the one
+/// that matters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// A single-column indexed lookup. The easiest plan Postgres makes, and
+    /// measured first only because it was already there.
+    Lookup,
+    /// A join between two tables a foreign key relates, at default settings.
+    /// The question people actually have about an upgrade.
+    Join,
+    /// The same join with `work_mem` at its floor, identically on every server
+    /// so it adds no version confound.
+    ///
+    /// This one is the sensitivity witness. A control arm that finds no
+    /// difference is only good news if the experiment could have found one, and
+    /// the survey next door has already watched spilling joins move between
+    /// runs of identical code. If this kind moves in the control arm, the
+    /// instrument demonstrably works and a zero elsewhere means stable. If
+    /// nothing moves anywhere, the honest reading is that nothing was measured.
+    Cramped,
 }
 
 struct Measured {
@@ -1311,7 +1394,24 @@ struct Measured {
     /// whole file keeps finding elsewhere.
     version: String,
     fingerprint: pgplan::fingerprint::Fingerprint,
-    queries: Vec<String>,
+    queries: Vec<(Kind, String)>,
+    /// The tables seeded, derived once and reused verbatim by the other
+    /// servers. Discovery ought to be deterministic given the same DDL; that
+    /// is an assumption, and passing the list costs less than relying on it.
+    filled: Vec<String>,
+    /// Whether this exact pipeline was shown to detect a difference it was
+    /// given on purpose.
+    ///
+    /// The positive control, and the reason the first two attempts at this
+    /// experiment were not evidence. A run that reports no differences is only
+    /// informative if it could have reported one, and a sensitivity witness
+    /// chosen by argument turned out to witness nothing: cramped joins were
+    /// picked because the survey's spill count moves between runs, but that
+    /// movement is in the default-to-cramped transition, and this compares
+    /// cramped against cramped. So instead an index is dropped on the deriving
+    /// server after its shapes are taken, the same query is replanned, and the
+    /// same compare() has to say something about it.
+    proved_it_can_see: bool,
     shapes: Vec<Shape>,
 }
 
@@ -1321,8 +1421,9 @@ fn measured(
     sql: &str,
     version: &str,
     seeder: &std::path::Path,
-    asked: Option<Vec<String>>,
+    asked: Option<Asked>,
 ) -> Option<Measured> {
+    let deriving = asked.is_none();
     let db = Db::at_version(version);
     let mut client = db.client();
 
@@ -1338,8 +1439,23 @@ fn measured(
     }
     let _ = client.batch_execute("SET search_path TO public;");
 
-    let wanted = lookups(&mut client, 6, false);
-    if wanted.is_empty() {
+    // What to fill: the lookup tables, and both sides of any foreign-key pair,
+    // because a join against an empty table plans as nothing.
+    let filled = match &asked {
+        Some((_, given)) => given.clone(),
+        None => {
+            let mut fill: BTreeSet<String> = lookups(&mut client, 6, false)
+                .into_iter()
+                .map(|look| look.table)
+                .collect();
+            for pair in related(&mut client, 2, false) {
+                fill.insert(pair.child);
+                fill.insert(pair.parent);
+            }
+            fill.into_iter().collect()
+        }
+    };
+    if filled.is_empty() {
         return None;
     }
     if seeder.exists() {
@@ -1352,9 +1468,9 @@ fn measured(
             "--allow-nonempty".into(),
             "--probe".into(),
         ];
-        for look in &wanted {
+        for table in &filled {
             args.push("--include".into());
-            args.push(look.table.clone());
+            args.push(table.clone());
         }
         let finished = std::process::Command::new(seeder)
             .args(&args)
@@ -1370,18 +1486,35 @@ fn measured(
     let _ = client.batch_execute("ANALYZE;");
 
     let queries = match asked {
-        Some(given) => given,
+        Some((given, _)) => given,
         None => {
             let mut out = Vec::new();
             for look in lookups(&mut client, 6, true) {
                 let Some(value) = a_value(&mut client, &look) else {
                     continue;
                 };
-                out.push(format!(
-                    "SELECT * FROM {} WHERE {} = {value}",
-                    quote(&look.table),
-                    quote(&look.column)
+                out.push((
+                    Kind::Lookup,
+                    format!(
+                        "SELECT * FROM {} WHERE {} = {value}",
+                        quote(&look.table),
+                        quote(&look.column)
+                    ),
                 ));
+            }
+            // The parent on the left, so the child is the nullable side, for
+            // the same reason the survey does it: otherwise the planner is free
+            // to swap them and the query stops being the one that was intended.
+            for pair in related(&mut client, 2, true) {
+                let join = format!(
+                    "SELECT count(*) FROM {} p LEFT JOIN {} c ON c.{} = p.{}",
+                    quote(&pair.parent),
+                    quote(&pair.child),
+                    quote(&pair.key),
+                    quote(&pair.referenced)
+                );
+                out.push((Kind::Join, join.clone()));
+                out.push((Kind::Cramped, join));
             }
             out
         }
@@ -1390,16 +1523,54 @@ fn measured(
     // Every question has to get an answer on every server, or the indexes stop
     // lining up and query three is compared against query four.
     let mut shapes = Vec::new();
-    for query in &queries {
-        let plan = plan_of(&mut client, query).ok()?;
-        shapes.push(Shape::of(&plan));
+    let _ = client.batch_execute("SET statement_timeout = '60s'");
+    for (kind, query) in &queries {
+        if *kind == Kind::Cramped {
+            let _ = client.batch_execute("SET work_mem = '64kB'");
+        }
+        let plan = plan_of(&mut client, query).ok();
+        if *kind == Kind::Cramped {
+            let _ = client.batch_execute("RESET work_mem");
+        }
+        shapes.push(Shape::of(&plan?));
     }
+    let _ = client.batch_execute("RESET statement_timeout");
     let fingerprint = pgplan::fingerprint::of(&mut client, &["public".to_string()]).ok()?;
+
+    // The positive control. Only on the server that derived the questions, and
+    // only after everything above has been recorded — this mutates the schema,
+    // and the server is thrown away immediately afterwards.
+    let mut proved_it_can_see = false;
+    if deriving {
+        for look in lookups(&mut client, 6, true) {
+            let Some(at) = queries.iter().position(|(kind, query)| {
+                *kind == Kind::Lookup && query.contains(&quote(&look.table))
+            }) else {
+                continue;
+            };
+            if !shapes[at].indexes.contains(&look.index) {
+                continue;
+            }
+            if client
+                .batch_execute(&format!("DROP INDEX {}", quote(&look.index)))
+                .is_err()
+            {
+                continue;
+            }
+            let _ = client.batch_execute(&format!("ANALYZE {}", quote(&look.table)));
+            if let Ok(plan) = plan_of(&mut client, &queries[at].1) {
+                proved_it_can_see = !compare(&shapes[at], &Shape::of(&plan)).is_empty();
+            }
+            break;
+        }
+    }
     let version: String = client.query_one("SHOW server_version", &[]).ok()?.get(0);
     Some(Measured {
         version,
         fingerprint,
         queries,
+        filled,
+        proved_it_can_see,
         shapes,
     })
 }
