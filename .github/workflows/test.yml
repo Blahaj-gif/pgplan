@@ -73,7 +73,18 @@ jobs:
       # One thread: each test starts its own server, and several at once on a
       # two-core runner is how a suite starts failing for reasons that are
       # about the runner rather than the code.
-      - run: cargo test --test regressions --test cli -- --test-threads=1
+      #
+      # `corpus` is here for its fast tests, not its survey — the survey is
+      # `#[ignore]`d and takes twenty minutes. Those fast tests were running
+      # nowhere at all: not in `--lib`, not in this job, not in stability. The
+      # file holds the SQL that decides which tables the survey measures and
+      # which statements a dump contributes, and a fault in either silently
+      # changes every number the README publishes. One of them did: a dollar
+      # quote opened and closed on one line convinced the splitter it was inside
+      # a function body for the rest of the file, and Lago's 139 tables were
+      # reported as a schema with no indexable lookup. The regression test for
+      # that existed and nothing ran it.
+      - run: cargo test --test regressions --test cli --test corpus -- --test-threads=1
 
   stability:
     name: it must not flap

@@ -1575,6 +1575,218 @@ fn measured(
     })
 }
 
+/// A schema built so that every clause of the two discovery queries has
+/// something to include and something to exclude.
+///
+/// These two queries decide *what gets measured at all*, so a fault in either
+/// silently changes every denominator this project publishes — which is exactly
+/// how Lago's 139 tables came to be reported as "no indexable lookup". They had
+/// four tests between them, none of which ran in CI, and every number on the
+/// results page rests on them.
+const DISCOVERY: &str = "
+    -- lookups(): one qualifying table, and one table per reason to be excluded.
+    CREATE TABLE look_int   (id serial PRIMARY KEY, v integer);
+    CREATE INDEX look_int_v ON look_int (v);
+
+    CREATE TABLE look_text  (id serial PRIMARY KEY, v text);
+    CREATE INDEX look_text_v ON look_text (v);
+
+    -- Only a primary key: it backs a constraint and is not what a careless
+    -- migration drops.
+    CREATE TABLE only_pk    (id serial PRIMARY KEY, v integer);
+
+    -- Only a unique index. Postgres refuses to drop it on its own, and leaving
+    -- it in made a failed DROP look like a missed detection.
+    CREATE TABLE only_unique(id serial PRIMARY KEY, v integer UNIQUE);
+
+    -- Only a two-column index. Not the shape an application lookup issues.
+    CREATE TABLE only_multi (id serial PRIMARY KEY, a integer, b integer);
+    CREATE INDEX only_multi_ab ON only_multi (a, b);
+
+    -- Indexed, single column, and not a type this measures.
+    CREATE TABLE only_bool  (id serial PRIMARY KEY, v boolean);
+    CREATE INDEX only_bool_v ON only_bool (v);
+
+    -- related(): a parent with two children, one of whose keys somebody
+    -- indexed and one of whose keys nobody did.
+    CREATE TABLE fk_parent  (id integer PRIMARY KEY);
+    CREATE TABLE fk_bare    (id serial PRIMARY KEY,
+                             parent_id integer REFERENCES fk_parent(id));
+    CREATE TABLE fk_indexed (id serial PRIMARY KEY,
+                             parent_id integer REFERENCES fk_parent(id));
+    CREATE INDEX fk_indexed_parent ON fk_indexed (parent_id);
+
+    -- A table that references itself. Which side of the join is which stops
+    -- being a question with an answer.
+    CREATE TABLE fk_self    (id integer PRIMARY KEY,
+                             boss integer REFERENCES fk_self(id));
+
+    -- A two-column foreign key. The join this builds names one column.
+    CREATE TABLE fk_pair_parent (a integer, b integer, PRIMARY KEY (a, b));
+    CREATE TABLE fk_pair_child  (a integer, b integer,
+                                 FOREIGN KEY (a, b) REFERENCES fk_pair_parent(a, b));
+";
+
+/// Enough rows that `reltuples` clears the five-hundred-row floor, in the
+/// tables the row-sensitive half of each query should find.
+const DISCOVERY_ROWS: &str = "
+    INSERT INTO look_int (v) SELECT g FROM generate_series(1, 600) g;
+    INSERT INTO look_text (v) SELECT 't' || g FROM generate_series(1, 600) g;
+    INSERT INTO fk_parent (id) SELECT g FROM generate_series(1, 600) g;
+    INSERT INTO fk_bare (parent_id) SELECT (g % 600) + 1 FROM generate_series(1, 600) g;
+    INSERT INTO fk_indexed (parent_id) SELECT (g % 600) + 1 FROM generate_series(1, 600) g;
+    ANALYZE;
+";
+
+#[test]
+fn a_lookup_is_a_non_unique_single_column_index_on_a_scalar() {
+    let db = Db::start();
+    db.apply(DISCOVERY);
+    let mut client = db.client();
+
+    let found: BTreeSet<String> = lookups(&mut client, 50, false)
+        .into_iter()
+        .map(|look| look.table)
+        .collect();
+    assert!(
+        found.contains("look_int"),
+        "an int index qualifies: {found:?}"
+    );
+    assert!(
+        found.contains("look_text"),
+        "a text index qualifies: {found:?}"
+    );
+    assert!(
+        !found.contains("only_pk"),
+        "a primary key is not a lookup index"
+    );
+    assert!(
+        !found.contains("only_unique"),
+        "a unique index backs a constraint and cannot be dropped on its own"
+    );
+    assert!(
+        !found.contains("only_multi"),
+        "a two-column index is not the shape an application lookup issues"
+    );
+    assert!(
+        !found.contains("only_bool"),
+        "boolean is not among the types this measures"
+    );
+
+    // The column reported has to be the indexed one, or every query built from
+    // this is about a different column than the index it is testing.
+    let by_table: Vec<Lookup> = lookups(&mut client, 50, false);
+    let int_lookup = by_table
+        .iter()
+        .find(|look| look.table == "look_int")
+        .expect("look_int");
+    assert_eq!(int_lookup.column, "v");
+    assert_eq!(int_lookup.index, "look_int_v");
+
+    // With nothing inserted, nothing has rows behind it.
+    assert!(
+        lookups(&mut client, 50, true).is_empty(),
+        "reltuples is unset on a fresh table, so the row-sensitive form must \
+         find nothing"
+    );
+
+    db.apply(DISCOVERY_ROWS);
+    let with_rows: BTreeSet<String> = lookups(&mut client, 50, true)
+        .into_iter()
+        .map(|look| look.table)
+        .collect();
+    assert!(with_rows.contains("look_int"), "600 rows clears the floor");
+    assert!(
+        !with_rows.contains("only_pk"),
+        "rows do not make a primary key into a lookup index"
+    );
+
+    // One per table, however many indexes it has: several lookups on one table
+    // measure the same thing.
+    db.apply("CREATE INDEX look_int_id ON look_int (id); ANALYZE look_int;");
+    let per_table = lookups(&mut client, 50, false);
+    assert_eq!(
+        per_table.iter().filter(|l| l.table == "look_int").count(),
+        1,
+        "a table with two qualifying indexes still contributes one lookup"
+    );
+    assert_eq!(
+        lookups(&mut client, 1, false).len(),
+        1,
+        "the limit is honoured"
+    );
+}
+
+#[test]
+fn a_pair_is_a_single_column_foreign_key_between_two_tables() {
+    let db = Db::start();
+    db.apply(DISCOVERY);
+    let mut client = db.client();
+
+    let pairs = related(&mut client, 50, false);
+    let names: BTreeSet<String> = pairs.iter().map(|p| p.child.clone()).collect();
+    assert!(
+        names.contains("fk_bare"),
+        "an unindexed key is a pair: {names:?}"
+    );
+    assert!(
+        names.contains("fk_indexed"),
+        "an indexed key is also a pair"
+    );
+    assert!(
+        !names.contains("fk_self"),
+        "a self-reference has no outer and inner side to speak of"
+    );
+    assert!(
+        !names.contains("fk_pair_child"),
+        "a two-column key cannot be joined on the one column this builds"
+    );
+
+    let bare = pairs
+        .iter()
+        .find(|p| p.child == "fk_bare")
+        .expect("fk_bare");
+    assert_eq!(bare.parent, "fk_parent");
+    assert_eq!(bare.key, "parent_id");
+    assert_eq!(bare.referenced, "id");
+    assert!(!bare.indexed, "nobody indexed fk_bare.parent_id");
+
+    let indexed = pairs
+        .iter()
+        .find(|p| p.child == "fk_indexed")
+        .expect("fk_indexed");
+    assert!(indexed.indexed, "fk_indexed.parent_id has an index on it");
+
+    // Unindexed first, because those are the pairs that can produce the shape
+    // the loop experiment is looking for.
+    assert_eq!(
+        pairs.first().map(|p| p.child.as_str()),
+        Some("fk_bare"),
+        "the pairs worth measuring come first: {:?}",
+        pairs.iter().map(|p| &p.child).collect::<Vec<_>>()
+    );
+
+    assert!(
+        related(&mut client, 50, true).is_empty(),
+        "with no rows on either side, a join plans as nothing"
+    );
+
+    db.apply(DISCOVERY_ROWS);
+    let with_rows: BTreeSet<String> = related(&mut client, 50, true)
+        .into_iter()
+        .map(|p| p.child)
+        .collect();
+    assert!(
+        with_rows.contains("fk_bare"),
+        "600 rows on both sides: {with_rows:?}"
+    );
+    assert_eq!(
+        related(&mut client, 1, true).len(),
+        1,
+        "the limit is honoured"
+    );
+}
+
 #[test]
 fn the_statement_splitter_handles_what_a_dump_contains() {
     assert_eq!(statements("SELECT 1; SELECT 2;").len(), 2);
